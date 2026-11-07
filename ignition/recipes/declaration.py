@@ -204,6 +204,7 @@ class Recipe:
     `mla_compute_modes` declares the attention arithmetic constraints a plan may select,
     independently of KV storage encoding and kernel tuning. `mla_compute_mode` and
     `expert_scale_compression` supply defaults when their preparation flags are omitted.
+    `expert_scale_compression_by_rank` overrides that default for declared rank counts.
     `export_repository` names the Hugging Face destination and the default local snapshot
     namespace. Export writes locally; it does not upload or select a signing identity.
     `b12x_environment` holds the b12x settings the recipe prepares with. b12x reads them
@@ -239,6 +240,7 @@ class Recipe:
     mla_compute_modes: tuple[str, ...] = ("auto",)
     mla_compute_mode: str = "auto"
     expert_scale_compression: str | None = None
+    expert_scale_compression_by_rank: Mapping[int, str | None] = field(default_factory=lambda: MappingProxyType({}))
     export_repository: str = ""
     # Preparation overrides for vocabulary and transition projections used only by proposals.
     draft_head_quantizations: tuple[str, ...] = ()

@@ -38,6 +38,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run a native Parallax shadow session with in-process prediction plugins.
+    #[cfg(unix)]
+    Parallax(ParallaxArgs),
     /// Serve a local package or download a prepared package from Hugging Face.
     Run(Box<Run>),
     /// Download a prepared package from the hardware's Hugging Face revision.
@@ -870,6 +873,18 @@ pub struct ServingOptions {
     #[arg(long, value_name = "N", help_heading = "Speculation options")]
     pub mtp_draft_tokens: Option<usize>,
 
+    /// Enable prepared Parallax routing telemetry for the selected execution mode.
+    #[arg(long, help_heading = "Advanced serving options")]
+    pub parallax_routing: bool,
+
+    /// Configure compiled in-process Parallax predictors; requires routing telemetry.
+    #[arg(long, value_name="PATH", requires="parallax_routing", help_heading="Advanced serving options")]
+    pub parallax_profile: Option<PathBuf>,
+
+    /// Configure experimental GB300 expert storage with Grace backing and a fixed HBM pool.
+    #[arg(long, value_name="PATH", requires="parallax_profile", help_heading="Advanced serving options")]
+    pub parallax_residency: Option<PathBuf>,
+
     /// Augment learned drafts with shared decoded history; requires prepared history inputs.
     #[arg(
         long,
@@ -1036,6 +1051,15 @@ impl ServingOptions {
         if let Some(n) = self.max_concurrency {
             options.extend(["--max-concurrency".into(), n.to_string()]);
         }
+        if self.parallax_routing {
+            options.push("--parallax-routing".into());
+        }
+        if let Some(path) = &self.parallax_profile {
+            options.extend(["--parallax-profile".into(),path.display().to_string()]);
+        }
+        if let Some(path) = &self.parallax_residency {
+            options.extend(["--parallax-residency".into(),path.display().to_string()]);
+        }
         if let Some(n) = self.mtp_draft_tokens {
             options.extend(["--mtp-draft-tokens".into(), n.to_string()]);
         }
@@ -1140,6 +1164,8 @@ impl ServingOptions {
             embedding_table_workers: self.embedding_table_workers,
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
             mtp_draft_tokens: self.mtp_draft_tokens,
+            parallax_routing: self.parallax_routing,
+            parallax_residency: None,
             history_drafts: if self.history_drafts {
                 Some(true)
             } else if self.no_history_drafts {
@@ -1517,6 +1543,7 @@ mod tests {
             "--max-concurrency",
             "3",
             "--mtp-draft-tokens=0",
+            "--parallax-routing",
             "--embedding-table-storage",
             "ram",
             "--prefix-cache-memory",
@@ -1534,6 +1561,8 @@ mod tests {
         assert_eq!(options.embedding_table_storage, Some(Storage::Ram));
         assert_eq!(options.max_concurrency, Some(3));
         assert_eq!(options.mtp_draft_tokens, Some(0));
+        assert!(options.parallax_routing);
+        assert!(args.rank_options().contains(&"--parallax-routing".to_string()));
         assert_eq!(
             options.prefix_cache,
             PrefixCacheOffload {
@@ -2242,4 +2271,28 @@ mod cache_cli_tests {
             "download cache selection requires --downloads"
         );
     }
+}
+
+/// A bounded single-GPU research session; serving remains the normal native path.
+#[cfg(unix)]
+#[derive(Debug, Args)]
+pub struct ParallaxArgs {
+    /// JSON package, catalog, cost model, GPU and compiled predictor configuration.
+    #[arg(long, value_name = "PATH", required_unless_present="replay", conflicts_with="replay")]
+    pub experiment: Option<PathBuf>,
+    /// Re-evaluate a saved native capture without loading a model or using a GPU.
+    #[arg(long, value_name="PATH")]
+    pub replay: Option<PathBuf>,
+    /// Alternate evaluation JSON for recorded forecasts; leaves the saved capture unchanged.
+    #[arg(long, value_name="PATH", requires="replay")]
+    pub evaluation_config: Option<PathBuf>,
+    /// New directory for routing, predictions, responses and logs.
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+    /// Number of ordinary demonstration requests, each producing 128 tokens.
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=6))]
+    pub requests: u8,
+    /// Print session changes without an interactive terminal dashboard.
+    #[arg(long)]
+    pub plain: bool,
 }

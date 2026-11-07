@@ -4,6 +4,8 @@
 
 """Compose a GLM rank's text forward, request consumption, and completion."""
 
+from copy import copy
+
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.sampling import PreparedSampling
 from ignition.components.state import save_hidden
@@ -37,6 +39,11 @@ class PreparedGeneration:
         self.completion.prepare_broadcast(runtime=decoder.lm_head.gather.runtime, session=session,
             coordinator=coordinator, name=name + ".sampling")
         self.compilation_variant = "sample"
+
+    def with_routing_trace(self, trace):
+        traced = copy(self)
+        traced.decoder = self.decoder.with_routing_trace(trace)
+        return traced
 
     def rebind_pages(self, pages):
         self.decoder.rebind_pages()

@@ -4,6 +4,7 @@
 
 """Complete GLM text forwards with shared layer scratch and sharded vocabulary weights."""
 
+from copy import copy
 from dataclasses import dataclass
 
 import torch
@@ -103,7 +104,8 @@ class PreparedDecoder:
 
     def __init__(self, weights: ModelWeights, scratch: DecoderScratch, state: DecoderState,
                  metadata: DecoderMetadata, *, mode, runtime, vocabulary_runtime, coordinator, session, name,
-                 workspace, progress=None, feedback=None, max_cache_pages=None, context=None, kda_records=None, scoring=None, vision=None):
+                 workspace, progress=None, feedback=None, max_cache_pages=None, context=None, kda_records=None, scoring=None, vision=None,
+                 routing_trace=None):
         language = weights.tree.model.language_model
         if len(weights.layers) != 45 or len(language.layers) != 45 or len(state.layers) != 45:
             raise ValueError("GLM text execution requires all 45 decoder layers")
@@ -112,6 +114,7 @@ class PreparedDecoder:
         if metadata.sample_indices.shape != scratch.hidden.shape[:1]:
             raise ValueError("GLM sample indices and hidden-output capacities differ")
         self.weights, self.scratch, self.state, self.metadata = weights, scratch, state, metadata
+        self.routing_trace = routing_trace
         self.vision = vision if mode == "prefill" else None
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=154880, session=session, coordinator=coordinator, name=name + ".prompt", copy_source=True)
@@ -130,6 +133,9 @@ class PreparedDecoder:
                 carry=None if index == 0 else scratch.mlp_hc, defer_post=index < len(language.layers) - 1,
                 max_cache_pages=max_cache_pages, context=context,
                 kda_records=None if kda_records is None or indexed else kda_records.layer(index))
+            if routing_trace is not None and isinstance(layer_weights.mlp, MoEWeights):
+                layer.mlp.routing_counter = routing_trace.counter(index, layer.mlp.scratch.router.ids,
+                    metadata.recurrent.num_tokens)
             self.layers.append(layer)
             if progress is not None:
                 progress(f"declared {mode} layer {index + 1}/45")
@@ -142,6 +148,27 @@ class PreparedDecoder:
             scratch.local_logits, scratch.logits, runtime=vocabulary_runtime, coordinator=coordinator,
             session=session, name=f"{name}.lm_head")
 
+    def with_routing_trace(self, trace):
+        """Share prepared storage across serial plain and traced graph variants.
+
+        Only wrappers carrying instrumentation differ. Operators, metadata and
+        continuation state retain their original owners and tuning bindings.
+        Never mutate a plain layer: it must capture without counter operations.
+        """
+        if trace is None or self.routing_trace is not None:
+            raise ValueError("routing instrumentation requires an untraced decoder")
+        traced = copy(self)
+        traced.routing_trace = trace
+        traced.layers = []
+        for index, (layer, weights) in enumerate(zip(self.layers, self.weights.layers, strict=True)):
+            if isinstance(weights.mlp, MoEWeights):
+                layer = copy(layer)
+                layer.mlp = copy(layer.mlp)
+                layer.mlp.routing_counter = trace.counter(index, layer.mlp.scratch.router.ids,
+                    self.metadata.recurrent.num_tokens)
+            traced.layers.append(layer)
+        return traced
+
     def rebind_pages(self):
         """Rebind every sparse-attention layer to the continuation pool's current page pools."""
         for layer in self.layers:
@@ -150,6 +177,8 @@ class PreparedDecoder:
 
     def __call__(self):
         s, language = self.scratch, self.weights.tree.model.language_model
+        if self.routing_trace is not None:
+            self.routing_trace.begin()
         self.embedding()
         if self.vision is not None:
             self.vision.inject(self.metadata, s.embedding)

@@ -249,7 +249,7 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
     }
     Ok(ExecutionManifest {
         collectives: None,
-        engram: crate::embedding_tables::binding(value)?,
+        residency: None, engram: crate::embedding_tables::binding(value)?,
         cache: None,
         offload: None,
         abi_version: field!(value, "abi_version", u32),
@@ -270,6 +270,9 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
 
 #[pyclass(module = "flare_heliopause")]
 struct ExecutionCompletion {
+    #[cfg(feature = "qualification")]
+    #[pyo3(get)]
+    routing_json: Option<String>,
     #[pyo3(get)]
     fence: u64,
     #[pyo3(get)]
@@ -372,6 +375,21 @@ impl PreparedGraphExecutor {
         py.detach(|| self.worker.poll())
             .map(|completion| {
                 completion.map(|completion| ExecutionCompletion {
+                    #[cfg(feature = "qualification")]
+                    routing_json: completion.routing.as_ref().map(|routing| {
+                        match routing {
+                            crate::parallax::RoutingReadout::Invalid =>
+                                serde_json::json!({"valid": false}),
+                            crate::parallax::RoutingReadout::Valid(sample) =>
+                                serde_json::json!({"valid": true, "submission": sample.submission,
+                                    "demand_lower_bound_ns": sample.demand_lower_bound_ns,
+                                    "available_ns": sample.available_ns,
+                                    "layers": sample.layers.iter().map(|layer|
+                                        serde_json::json!({"layer": layer.layer, "tokens": layer.tokens,
+                                            "top_k": layer.top_k, "counts": layer.counts}))
+                                        .collect::<Vec<_>>() }),
+                        }.to_string()
+                    }),
                     fence: completion.fence.0,
                     graph_index: completion.graph_index,
                     logprobs: completion.logprobs.map(|slots| slots.into_iter().map(|positions|
@@ -585,6 +603,7 @@ fn flare_heliopause(module: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         module.add_class::<GraphReplayWorker>()?;
         module.add_class::<ReplayCompletion>()?;
+        module.add_class::<crate::residency_test::ExpertResidencyTestStorage>()?;
         module.add_function(wrap_pyfunction!(validate_prepared_contract, module)?)?;
     }
     #[cfg(all(feature = "server", feature = "qualification"))]
@@ -633,7 +652,7 @@ mod binding_tests {
         Python::attach(|py| {
             let module = PyModule::new(py, "flare_heliopause").unwrap();
             flare_heliopause(&module).unwrap();
-            for name in ["GraphReplayWorker", "ReplayCompletion"] {
+            for name in ["GraphReplayWorker", "ReplayCompletion", "ExpertResidencyTestStorage"] {
                 assert_eq!(
                     module.hasattr(name).unwrap(),
                     cfg!(feature = "qualification")

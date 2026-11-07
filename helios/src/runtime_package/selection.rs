@@ -28,6 +28,9 @@ pub struct LoadOptions {
     pub embedding_table_workers: Option<usize>,
     pub max_concurrency: Option<usize>,
     pub mtp_draft_tokens: Option<usize>,
+    /// Select prepared routing histograms for the serving mode; disabled by default.
+    pub parallax_routing: bool,
+    pub parallax_residency: Option<super::ResidencyOptions>,
     pub history_drafts: Option<bool>,
     /// Select one exact packed verification capacity per batch before proposal sampling.
     pub mtp_verification_token_budget: Option<usize>,
@@ -39,6 +42,55 @@ pub struct LoadOptions {
     pub prefix_cache: crate::offload::PrefixCacheOffload,
     /// For a package whose ranks run on separate hosts: the one rank this host loads.
     pub cluster_rank: Option<usize>,
+}
+
+fn routing_target(graph: &super::wire::ExecutionGraph) -> bool {
+    matches!(graph.kind.as_str(), "decode" | "prefill" | "scored_prefill" | "speculative")
+}
+
+fn validate_routing_catalog(execution: &super::wire::Execution, enabled: bool, speculation: bool) -> Result<()> {
+    let output = execution.buffers.iter().any(|buffer| buffer.name == crate::parallax::BUFFER);
+    let traced = execution.graphs.iter().any(|graph| graph.routing_trace);
+    if enabled && !traced || output != traced {
+        return Err(invalid("Parallax requires routing storage and paired prepared graph variants"));
+    }
+    if enabled && execution.graphs.iter().any(|graph| graph.kind == "mixed") {
+        return Err(invalid("Parallax tracing does not support mixed execution"));
+    }
+    if !traced { return Ok(()); }
+    for graph in &execution.graphs {
+        let target = routing_target(graph);
+        let ordinary = target && graph.kind != "speculative"
+            && graph.speculation_enabled != Some(true);
+        if ordinary && graph.speculation_enabled != Some(false) {
+            return Err(invalid("routing catalogs require an explicit ordinary execution mode"));
+        }
+        if graph.routing_trace && (!target || graph.speculation_enabled.is_none()
+            || graph.kind == "speculative" && graph.speculation_enabled != Some(true)) {
+            return Err(invalid("routing telemetry requires target execution with an explicit speculation mode"));
+        }
+        // Older packages may contain traced ordinary graphs but untraced MTP.
+        // They remain usable with tracing off or ordinary execution selected.
+        let selected = enabled && target && if graph.kind == "speculative" {
+            speculation
+        } else { graph.speculation_enabled.is_none_or(|mode| mode == speculation) };
+        if !graph.routing_trace && !ordinary && !selected { continue; }
+        let mut expected = graph.clone();
+        expected.routing_trace = !expected.routing_trace;
+        expected.name.clear();
+        expected.estimated_duration_ns = 0;
+        expected.tuned_bindings.clear();
+        if !execution.graphs.iter().any(|candidate| {
+            let mut candidate = candidate.clone();
+            candidate.name.clear();
+            candidate.estimated_duration_ns = 0;
+            candidate.tuned_bindings.clear();
+            candidate == expected
+        }) {
+            return Err(invalid("Parallax requires matching counter-free and traced graph geometry and inputs"));
+        }
+    }
+    Ok(())
 }
 
 impl LoadOptions {
@@ -176,6 +228,9 @@ impl LoadOptions {
                 .ok_or_else(|| invalid("no captured speculative width fits the requested draft depth"))?) };
         let enabled = drafts > 0 && fixed != Some(1) && !widths.is_empty();
         let fixed = enabled.then_some(fixed).flatten();
+        if self.parallax_routing && packages.len() != 1 {
+            return Err(invalid("Parallax tracing requires one rank"));
+        }
         if self.history_drafts == Some(true) && (!enabled || source != 1) {
             return Err(invalid("--history-drafts requires enabled learned speculation"));
         }
@@ -238,7 +293,7 @@ impl LoadOptions {
                     || (kind == GraphKind::Speculative && graph.token_capacity > 1 && graph.packed_token_capacity > token_capacity)
                     || !names.insert(graph.name.clone())
                     || !variants.insert((graph.kind.clone(), graph.sampling_mode.clone(), graph.batch_capacity,
-                        graph.token_capacity, graph.prefill_capacity, graph.packed_token_capacity, graph.draft_tokens, graph.draft_source, graph.speculation_enabled)) {
+                        graph.token_capacity, graph.prefill_capacity, graph.packed_token_capacity, graph.draft_tokens, graph.draft_source, graph.speculation_enabled, graph.routing_trace)) {
                     return Err(invalid("invalid or duplicate serving graph variant"));
                 }
             }
@@ -251,7 +306,9 @@ impl LoadOptions {
             if names != resources || resources.len() != package.graphs.len() {
                 return Err(invalid("execution catalog must describe every captured graph exactly once"));
             }
+            validate_routing_catalog(execution, self.parallax_routing, enabled)?;
             execution.graphs.retain(|graph| {
+                if graph.routing_trace != (self.parallax_routing && routing_target(graph)) { return false; }
                 graph.batch_capacity <= active.next_power_of_two() as u64
                     && graph.speculation_enabled.is_none_or(|value| value == enabled)
                     && (graph.kind != "decode" || !enabled)
@@ -265,6 +322,9 @@ impl LoadOptions {
                             && self.mtp_verification_token_budget.is_none_or(|budget|
                                 graph.packed_token_capacity == (budget as u64).min(graph.batch_capacity * graph.token_capacity)))
             });
+            if !self.parallax_routing {
+                execution.buffers.retain(|buffer| buffer.name != crate::parallax::BUFFER);
+            }
             let mut depths = std::collections::HashMap::new();
             for graph in &execution.graphs {
                 if let Some(depth) = graph.draft_tokens {
@@ -551,6 +611,115 @@ mod tests {
 
     fn config() -> Value {
         serde_json::json!({"speculative_token_capacity": 24, "speculative_widths": [1,2,3,4,5,6], "speculative_fixed_width": null})
+    }
+
+    fn routing_package_with_mtp(mtp: bool) -> Package {
+        let mut package = package();
+        let execution = package.execution.as_mut().unwrap();
+        if mtp {
+            for graph in &mut execution.graphs {
+                if graph.kind == "speculative" { graph.speculation_enabled = Some(true); }
+            }
+        }
+        execution.buffers.push(wire::Buffer { name: crate::parallax::BUFFER.into(),
+            ..Default::default() });
+        let traced: Vec<_> = execution.graphs.iter().filter(|graph| graph.kind == "decode"
+            || mtp && graph.kind == "speculative")
+            .cloned().map(|mut graph| {
+                graph.name.push_str("-parallax");
+                graph.routing_trace = true;
+                graph
+            }).collect();
+        for graph in &traced {
+            package.graphs.push(Graph { name: graph.name.clone(), resource: graph.name.clone(),
+                flags: 0, node_count: 1, edge_count: 0, functions: vec![] });
+        }
+        execution.graphs.extend(traced);
+        package
+    }
+
+    fn routing_package() -> Package { routing_package_with_mtp(false) }
+
+    #[test]
+    fn routing_is_explicit_and_disabled_catalog_omits_readback_storage() {
+        for (drafts, tracing) in [(0, false), (5, false), (0, true)] {
+            let mut packages = [routing_package()];
+            LoadOptions { mtp_draft_tokens: Some(drafts), parallax_routing: tracing,
+                ..Default::default() }.select(&mut packages, &mut config()).unwrap();
+            let selected = packages[0].execution.as_ref().unwrap();
+            assert_eq!(selected.buffers.iter().any(|buffer| buffer.name == crate::parallax::BUFFER), tracing);
+            for graph in &selected.graphs {
+                assert_eq!(graph.routing_trace, tracing && graph.kind == "decode");
+            }
+            assert!(packages[0].graphs.iter().all(|graph| selected.graphs.iter().any(|g| g.name == graph.name)));
+        }
+        let mut packages = [routing_package()];
+        assert!(LoadOptions { parallax_routing: true, ..Default::default() }
+            .select(&mut packages, &mut config()).unwrap_err().to_string().contains("matching counter-free"));
+    }
+
+    #[test]
+    fn routing_selects_complete_mtp_variants_and_preserves_disabled_execution() {
+        for drafts in [0, 3, 5] {
+            for adaptive in [false, true] {
+                for tracing in [false, true] {
+                    let mut packages = [routing_package_with_mtp(true)];
+                    LoadOptions { mtp_draft_tokens: Some(drafts), adaptive_verification: Some(adaptive),
+                        parallax_routing: tracing, ..Default::default() }
+                        .select(&mut packages, &mut config()).unwrap();
+                    let execution = packages[0].execution.as_ref().unwrap();
+                    assert_eq!(execution.buffers.iter().any(|b| b.name == crate::parallax::BUFFER), tracing);
+                    assert!(execution.graphs.iter().any(routing_target));
+                    for graph in &execution.graphs {
+                        assert_eq!(graph.routing_trace, tracing && routing_target(graph));
+                        if routing_target(graph) {
+                            assert_eq!(graph.kind == "speculative", drafts > 0);
+                        }
+                    }
+                }
+            }
+        }
+        let mut package = routing_package_with_mtp(true);
+        let execution = package.execution.as_mut().unwrap();
+        execution.graphs.retain(|g| !(g.kind == "speculative" && g.token_capacity == 4 && g.routing_trace));
+        assert!(validate_routing_catalog(execution, true, true).is_err());
+        assert!(validate_routing_catalog(execution, true, false).is_ok());
+        assert!(validate_routing_catalog(execution, false, true).is_ok());
+
+        let mut package = routing_package_with_mtp(true);
+        let execution = package.execution.as_mut().unwrap();
+        let mut prefill = execution.graphs.iter().find(|g| g.kind == "decode" && !g.routing_trace).unwrap().clone();
+        prefill.kind = "prefill".into();
+        prefill.name = "prefill64-mtp".into();
+        prefill.token_capacity = 64;
+        prefill.speculation_enabled = Some(true);
+        execution.graphs.push(prefill.clone());
+        assert!(validate_routing_catalog(execution, true, true).is_err());
+        assert!(validate_routing_catalog(execution, false, true).is_ok());
+        prefill.name.push_str("-parallax");
+        prefill.routing_trace = true;
+        execution.graphs.push(prefill);
+        assert!(validate_routing_catalog(execution, true, true).is_ok());
+    }
+
+    #[test]
+    fn routing_requires_complete_matching_variants_and_explicit_ordinary_mode() {
+        for mutation in 0..5 {
+            let mut package = routing_package();
+            let execution = package.execution.as_mut().unwrap();
+            let graph = execution.graphs.iter_mut().find(|graph| graph.routing_trace).unwrap();
+            match mutation {
+                0 => graph.input_bindings.push(wire::InputBinding { buffer_name: "unexpected".into(), ..Default::default() }),
+                1 => graph.speculation_enabled = Some(true),
+                2 => graph.routing_trace = false,
+                3 => execution.buffers.clear(),
+                _ => execution.graphs.retain(|graph| !graph.routing_trace),
+            }
+            assert!(validate_routing_catalog(execution, false, false).is_err());
+            assert!(validate_routing_catalog(execution, true, false).is_err());
+        }
+        assert!(validate_routing_catalog(package().execution.as_ref().unwrap(), false, false).is_ok());
+        assert!(validate_routing_catalog(package().execution.as_ref().unwrap(), true, false).is_err());
     }
 
     #[test]

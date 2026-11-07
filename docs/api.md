@@ -255,6 +255,78 @@ grows with queued data; large paused responses can retain more CPU memory.
 Finished responses awaiting delivery still count toward the admission limit,
 but no longer occupy a model execution slot or its live KV cache.
 
+## Experimental routing observations
+
+`GET /v1/parallax/routing?after=N` returns version-one aggregate routing records
+newer than routing sequence `N` (default zero). It uses normal API authentication.
+Collection requires both a package prepared with `--parallax-routing` and explicit
+`flare run --parallax-routing` activation. Normal serving returns `enabled: false`;
+reading the endpoint does not activate counters. This endpoint neither changes routing nor moves experts.
+
+The response includes `version`, `session`, `model_id`, `enabled`, `geometry`
+(`[layers, experts]`), `clock`, `native_now_ns`, `demand_timing`, `demand_scope`, `capacity`,
+`latest_sequence`, `dropped_total`, `invalid_total`, and `frames`. Each frame has
+`sequence`, `graph`, `phase`, `batch_size`, `concurrency`, and a `sample` containing
+`submission`, `demand_lower_bound_ns`, `available_ns`, and `layers`. Layer records
+contain canonical `layer`, valid `tokens`, `top_k`, and expert-indexed `counts`.
+No prompt content, token IDs or per-request identifiers are exposed.
+Phase `verify` reports target expert work from a complete speculative round,
+including candidates rejected after verification. Counts exclude padded target
+rows and draft-layer experts; they do not count only accepted output tokens.
+
+The native process uses its own monotonic clock. Demand is conservatively bounded
+by host dispatch before launch; availability follows the readback fence. An
+external predictor must additionally include HTTP receipt and queueing delay.
+The ring retains at most 32 records. Producer contention drops observations rather
+than waiting; invalid telemetry increments `invalid_total`. Retention eviction is
+visible as a sequence gap. Consumers must detect gaps, changed counters and changed
+sessions and start separate evaluation windows. This is an experimental observation
+feed, not a lossless tracing service. See [Parallax](parallax.md).
+
+`GET /v1/parallax/predictions` uses normal API authentication and returns the
+in-process observatory snapshot: mode, routing-frame count, worker counters,
+independent contender summaries, cost-profile identity and any capture error.
+With no runtime prediction profile it reports `enabled: false`. Reading it starts
+no work. Cost fields are estimates, not measured serving improvement. See the
+[native Parallax workflow](parallax-demo.md). The live response
+reports lifetime `routing_frames` and virtual residency, a bounded
+`evaluation_window_frames` for prediction accuracy, and `trace_complete` when
+initial trace retention has filled. Predictors continue after that point.
+`hardware.transfer_calibration` contains startup pinned-copy measurements;
+cold-execution costs remain profile inputs. Evaluation version 2 is explicit in
+`evaluation`: ranking coverage is per layer, with additional `coverage_by_layer_k`
+and `residency_budget_ranking` curves. Each contender exposes
+`cold_execution_saved_ns`, `eviction_execution_loss_ns`,
+`modeled_movement_cost_ns` and their difference, `modeled_balance_ns`.
+`predictor_runtime_total_ns` is reported separately. The modeled balance charges
+full copy costs and assumes the profile's cold penalty; it does not measure serving
+stalls, resource contention or throughput. Profiles without an evaluation override
+retain version 1 fields and semantics for exact replay.
+
+When physical storage is enabled, `physical_residency` reports actual HBM/Grace
+expert counts, mapping generation, pending state, and copy/publication counters
+including startup. Staged byte counts include copies later cancelled; a driver
+failure can leave transferred bytes unconfirmed. A 256-entry `movement_events`
+history records serving plan outcomes, target routing sequence and monotonic timing; `movement_event_total`
+exposes truncation. `cancelled_transactions` counts discarded staging.
+`active_policy` reports the selected provider, proposal count,
+no-movement decisions and failures. These fields are distinct from shadow
+contender ledgers; estimated gains are not measured throughput improvements.
+
+With physical storage and a prediction profile, `actual_ledger` records executed
+routes against the initial static placement, using each frame's captured host
+residency generation. Movement events include `copy_gpu_ns` (null if unavailable),
+`staged_bytes`, `publication_host_ns` and `submission_gate_closed_ns`. The last
+interval includes reader drain and publication, not necessarily GPU idle time.
+Ledger costs exclude initial placement; cancelled staging remains charged.
+`estimated_execution_saved_ns` and `estimated_balance_ns` are null until a
+shape-specific timing fit exists, or when observation history is incomplete.
+The balance is also null if a staged transaction lacks copy timing. Model coverage,
+prior-prediction error and bounded recent frame features are included. These
+observational estimates are separate from the profile-priced shadow balances;
+see [actual residency accounting](parallax-demo.md#experimental-gb300-residency).
+
+
 ## Health and metrics
 
 `GET /health` returns `{"status":"ok"}` while the model runtime is healthy and

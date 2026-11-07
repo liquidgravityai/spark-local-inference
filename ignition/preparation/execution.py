@@ -29,8 +29,14 @@ class GraphSignature:
     packed_token_capacity: int = 0
     draft_tokens: int | None = None
     confidence_width: int = 0
+    routing_trace: bool = False
 
     def __post_init__(self):
+        if type(self.routing_trace) is not bool:
+            raise TypeError("routing trace selection must be a boolean")
+        if self.routing_trace and (self.kind not in ("decode", "prefill", "scored_prefill", "speculative")
+                                   or self.speculation_enabled is None):
+            raise ValueError("routing trace graphs require target execution and an explicit speculation mode")
         if self.kind not in ("init", "restore", "snapshot", "prefill", "scored_prefill", "decode", "resume",
                              "vision", "speculative", "mixed"):
             raise ValueError("unknown prepared graph operation")
@@ -96,7 +102,7 @@ class GraphSignature:
         if any(name in self.inputs for name in ("frame_index", "submission_sequence", "completion_records",
                                                "completion_logprobs", "logprob_requested", "logprob_token_ids",
                                                "logprob_token_id_counts", "readiness_timestamps",
-                                               "completion_speculative_survival")):
+                                               "completion_speculative_survival", "parallax_routes_v1")):
             raise ValueError("reserved execution buffers are bound automatically")
 
 
@@ -221,12 +227,15 @@ class PreparedExecution(PreparedGraphBundle):
             signature = self.signatures[name]
             if not all_variants and signature.speculation_enabled not in (None, speculative):
                 continue
+            if not all_variants and signature.routing_trace:
+                continue
             inputs = (*reserved, *signature.inputs)
             graphs.append({"name": name, "kind": signature.kind, "handle": handle,
                 "sampling_mode": signature.sampling_mode,
                 "batch_capacity": signature.batch_capacity, "token_capacity": signature.token_capacity,
                 "prefill_capacity": signature.prefill_capacity,
                 "confidence_width": signature.confidence_width,
+                "routing_trace": signature.routing_trace,
                 "estimated_duration_ns": self.estimated_durations_ns[name],
                 "input_bindings": [{"buffer_name": field, "host_offset": offsets[field][0],
                                     "nbytes": offsets[field][1]} for field in inputs]})
@@ -239,6 +248,8 @@ class PreparedExecution(PreparedGraphBundle):
             if signature.draft_tokens is not None:
                 graphs[-1].update(draft_tokens=signature.draft_tokens,
                                   verify_tokens=signature.token_capacity, draft_source=1)
+        if not all_variants:
+            descriptors = [value for value in descriptors if value["name"] != "parallax_routes_v1"]
         abi_version = 6
         return {"abi_version": abi_version, "completion_token_capacity": self.completion_token_capacity,
                 "context": context, "device": self.device,

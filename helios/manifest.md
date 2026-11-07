@@ -191,6 +191,35 @@ and branch; candidate and normalization work remain unchanged. Wider output
 strides and width-masked mixed merges require measurement. Equal readback bytes
 do not imply equal total work or efficiency.
 
+An optional `parallax_routes_v1` output has contiguous dtype int64 and shape
+`[2,L,4+E]`, with `1 <= L <= 256`, `1 <= E <= 4096`, and `L*(4+E) <= 1048576`.
+It is output-only, never an input or tuning status buffer. Unknown
+`parallax_routes_*` versions are rejected. The selected tracing catalog excludes
+mixed graphs and requires a single rank. The package field
+`ExecutionGraph.routing_trace` identifies traced variants; absent or false means
+counter-free execution. Native startup defaults to counter-free graphs and omits
+this output from the execution manifest, preventing routing readback. Explicit
+`--parallax-routing` requires traced counterparts for every target graph in the
+selected ordinary or MTP mode. Packages with only ordinary traced graphs still
+require MTP disabled when tracing. Paired variants must agree on geometry and
+input bindings. Decode, prefill, scored-prefill and complete speculative graphs reset the selected frame and
+write one row per canonical layer:
+`[submission_sequence, valid_tokens, top_k, invalid_route_count, expert_counts...]`.
+Dense layers write zero token/top-K/count fields. Counts exclude padded rows and
+sum to `valid_tokens * top_k`; expert columns are canonical IDs. Speculative counts
+cover all executed target verification rows, including rejected candidates; they
+are not accepted-output-token counts. Draft experts are excluded from this target
+catalog and remain resident. The v1 decoder
+accepts at most 262144 valid tokens per row and rejects stale sequences, invalid
+IDs or inconsistent totals as invalid telemetry, without changing model outputs.
+The native executor retains two readbacks and waits for each frame's existing
+transfer fence before decoding or reuse. Instrumented executions add `8*L*(4+E)`
+readback bytes per target graph and twice that persistent output storage;
+discrete devices also retain two pinned readback buffers. Counters add captured
+GPU work and native decoding/HTTP collection adds CPU work; overhead requires
+measurement. Host dispatch is a conservative demand lower bound, not a GPU layer
+timestamp. See [Parallax](../docs/parallax.md) for collector timing and limits.
+
 An optional `readiness_timestamps` output has dtype int64 and contiguous shape
 `[2,3*N]`, with `1 <= N <= 64`. Each frame holds one triple per embedding table:
 GPU timestamps before its external readiness wait, after readiness, and after a
@@ -399,3 +428,20 @@ Packages are trusted executable input. Listener configuration and API keys are
 supplied when launching. Resources remain owned until replay drains; a failed
 drain retains them until process termination. Incompatible files require
 re-export; there is no directory or JSON package loader.
+
+## Native expert residency ownership
+
+Package loading can attach an optional `ExecutionManifest.residency` binding to
+page-isolated immutable expert weights. The binding is runtime-owned Rust state;
+it is not an executable extension in package metadata or a Python callback.
+`NativeResources` retains the context, while Parallax owns physical expert
+mappings and the package retains their canonical virtual reservations.
+
+Exactly one graph executor may claim a binding. Each submitted frame acquires a
+reader lease before launching and releases it only after its completion event.
+Missing completion keeps storage retained. Staging uses preallocated spare HBM
+slots; publication stops submissions and waits for all expert readers to finish.
+Observed target routing events cancel late staging independently of forecast time
+estimates. Confirmed recoverable failures retain the previous placement; uncertain
+mapping or reader state prevents continued execution and resource destruction.
+Ordinary manifests carry no residency binding and retain their existing ownership.

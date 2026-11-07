@@ -175,7 +175,10 @@ def test_glm_stored_bytes_match_the_cached_checkpoint():
     tensors = inspect_indexed_checkpoint(GLM.snapshot(HUB)).tensors.values()
     checkpoint = GLM.checkpoint
     assert checkpoint.stored_bytes == sum(tensor.nbytes for tensor in tensors)
-    assert checkpoint.device_bytes == sum(tensor.nbytes for tensor in tensors)
+    compressed = sum(tensor.nbytes for tensor in tensors if ".experts." in tensor.name and ".csf32_" in tensor.name)
+    expanded = 42 * 288 * 3 * 4096 * 2048 // 16
+    assert checkpoint.scale_compressed_device_bytes["csf"] == checkpoint.stored_bytes
+    assert checkpoint.device_bytes == checkpoint.stored_bytes - compressed + expanded
     assert checkpoint.mapped_host_bytes == 0
     assert checkpoint.draft_bytes == sum(
         tensor.nbytes for tensor in tensors if tensor.name.startswith("model.language_model.layers.45."))

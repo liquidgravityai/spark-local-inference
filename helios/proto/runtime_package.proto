@@ -734,6 +734,8 @@ message ExecutionGraph {
   // Number of confidence prefixes produced per request in the selected completion frame.
   uint32 confidence_width = 14;
   repeated TunedBinding tuned_bindings = 15;
+  // True for target execution variants that produce the Parallax routing output.
+  bool routing_trace = 16;
 }
 enum DraftSource { NO_DRAFT = 0; MTP = 1; COPY_DRAFT = 2; }
 message InputBinding { string buffer_name = 1; uint64 host_offset = 2; uint64 nbytes = 3; }

@@ -344,7 +344,7 @@ fn completed(status: i64) -> FrameCompletion {
         reserved: 0,
         vector: Some(super::super::TokenVector { tokens: vec![-1; 16], ..Default::default() }),
     };
-    FrameCompletion {
+    FrameCompletion { routing: None,
         logprobs: None,
         prompt_logprobs: None,
         proposal_confidence: None,

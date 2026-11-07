@@ -382,7 +382,7 @@ fn completion(
             ..Default::default()
         };
     }
-    FrameCompletion {
+    FrameCompletion { routing: None,
         logprobs: None,
         prompt_logprobs: None,
         proposal_confidence: None,
@@ -1615,7 +1615,7 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
             worker
                 .complete(
                     GraphKind::Speculative,
-                    FrameCompletion {
+                    FrameCompletion { routing: None,
                         logprobs: None,
                         prompt_logprobs: None,
                         proposal_confidence: None,

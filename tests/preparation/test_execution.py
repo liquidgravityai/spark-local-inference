@@ -52,6 +52,34 @@ def test_manifest_offsets_are_stable_across_graphs(monkeypatch):
     assert manifest["buffers"][-1]["dtype"] == "bool"
 
 
+@pytest.mark.parametrize("kind,mode,width", [("decode", False, 1), ("prefill", True, 64),
+                                           ("speculative", True, 1), ("speculative", True, 6)])
+def test_routing_variants_are_exported_but_diagnostic_serving_defaults_to_inert(monkeypatch, kind, mode, width):
+    from dataclasses import replace
+    from ignition.preparation.runtime_package_pb2 import ExecutionGraph
+
+    plain = GraphSignature(kind, 1, width, speculation_enabled=mode)
+    traced = replace(plain, routing_trace=True)
+    execution = _execution(graphs={"plain": object(), "traced": object()},
+        signatures={"plain": plain, "traced": traced},
+        buffers=dict(_execution().buffers, parallax_routes_v1=_tensor("int64", (2, 45, 292))))
+    spans = [(4096, 4), (8192, 8), (12288, 2048), (16384, 128), (20480, 1), (24576, 210240)]
+    monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11, 12], spans))
+    ordinary = execution.manifest()
+    assert [graph["name"] for graph in ordinary["graphs"]] == ([] if kind == "prefill" else ["plain"])
+    assert not any(buffer["name"] == "parallax_routes_v1" for buffer in ordinary["buffers"])
+    exported = execution.manifest(all_variants=True)
+    assert [graph["routing_trace"] for graph in exported["graphs"]] == [False, True]
+    assert any(buffer["name"] == "parallax_routes_v1" for buffer in exported["buffers"])
+    graph = exported["graphs"][1]
+    encoded = ExecutionGraph(**{key: value for key, value in graph.items() if key != "handle"})
+    assert ExecutionGraph.FromString(encoded.SerializeToString()).routing_trace
+    assert not ExecutionGraph.FromString(b"").routing_trace
+    for kind, mode in [("resume", True), ("prefill", None), ("decode", None)]:
+        with pytest.raises(ValueError, match="explicit speculation mode"):
+            GraphSignature(kind, 1, 1, speculation_enabled=mode, routing_trace=True)
+
+
 def test_verification_keeps_prefix_width_separate_from_total_rows(monkeypatch):
     signature = GraphSignature('speculative', 4, 6, ('tokens',), packed_token_capacity=12)
     execution = _execution(graphs={'verify':object()}, signatures={'verify':signature})

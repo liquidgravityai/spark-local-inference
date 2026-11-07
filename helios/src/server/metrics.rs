@@ -210,6 +210,7 @@ const HOST_TOKEN_BUCKETS: [u64; 8] = [64, 256, 1024, 4096, 16384, 65536, 262144,
 
 #[derive(Default)]
 pub(super) struct Metrics {
+    pub parallax: super::parallax::Telemetry,
     pub scheduler_trace: scheduler::SchedulerMetrics,
     pub history_drafts: bool,
     total_pages: u64,

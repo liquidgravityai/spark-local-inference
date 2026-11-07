@@ -10,6 +10,23 @@ const VECTOR_RECORD_FIELDS: usize = 32;
 use super::*;
 
 #[test]
+fn parallax_optional_output_requires_known_bounded_readonly_geometry() {
+    let mut value = manifest();
+    value.buffers.push(BufferDescriptor { name: crate::parallax::BUFFER.into(), address: 0x10000,
+        nbytes: 288, dtype: Dtype::Int64, shape: vec![2, 3, 6], strides: vec![18, 6, 1] });
+    value.validate().unwrap();
+    let mut bad = value.clone();
+    bad.buffers.last_mut().unwrap().name = "parallax_routes_v2".into();
+    assert!(bad.validate().is_err());
+    let mut bad = value.clone();
+    bad.buffers.last_mut().unwrap().dtype = Dtype::Float32;
+    assert!(bad.validate().is_err());
+    value.graphs[0].input_bindings.push(InputBinding {
+        buffer_name: crate::parallax::BUFFER.into(), host_offset: 0, nbytes: 288 });
+    assert!(value.validate().is_err());
+}
+
+#[test]
 fn optional_readiness_output_preserves_uninstrumented_manifests_and_rejects_invalid_layouts() {
     let mut value = manifest();
     value.validate().unwrap();
@@ -192,7 +209,7 @@ pub(super) fn manifest() -> ExecutionManifest {
         ],
     };
     ExecutionManifest { completion_token_capacity: 16, tuning_graphs: vec![],
-        engram: None,
+        residency: None, engram: None,
         collectives: None,
         cache: None,
         offload: None,
@@ -1023,7 +1040,7 @@ fn packed_combined_peer_agreement_checks_the_complete_committed_vector() {
     vector.offered_drafts = 1;
     let record = CompletionRecord { generation: 1, submission_sequence: 1, consumed_tokens: 65,
         token_id: -1, status: 1, vector: Some(vector), ..Default::default() };
-    let completion = || FrameCompletion { speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
+    let completion = || FrameCompletion { routing: None, speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
         records: vec![record.clone(); 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
     for mutation in 0..5 {
         let root = completion(); let mut peer = completion();
@@ -1045,7 +1062,7 @@ fn packed_combined_peer_agreement_ignores_only_undefined_inactive_vector_payload
     let active = CompletionRecord { generation: 1, submission_sequence: 1, consumed_tokens: 65,
         token_id: -1, status: 1, vector: Some(TokenVector { verification_width: 6, tokens: vec![-1; 16], ..Default::default() }),
         ..Default::default() };
-    let mut root = FrameCompletion { speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
+    let mut root = FrameCompletion { routing: None, speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
         records: vec![active.clone(); 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
     root.records[3].status = 0;
     let mut peer_records = root.records.clone();
@@ -1059,7 +1076,7 @@ fn packed_combined_peer_agreement_ignores_only_undefined_inactive_vector_payload
         let bytes: Vec<_> = records.iter().flat_map(|r| r.fields()).flat_map(i64::to_le_bytes).collect();
         transport::decode_records(&bytes, crate::cache::Fence(1), 4, VECTOR_RECORD_FIELDS).unwrap();
     }
-    let mut peer = FrameCompletion { speculative_survival: None, prompt_logprobs: None, records: peer_records, fence: root.fence, graph_index: root.graph_index,
+    let mut peer = FrameCompletion { routing: None, speculative_survival: None, prompt_logprobs: None, records: peer_records, fence: root.fence, graph_index: root.graph_index,
         timing: Default::default(), logprobs: None, proposal_confidence: None };
     parallel::agree_speculative(&root, &peer).unwrap();
     peer.records[3].generation += 1;

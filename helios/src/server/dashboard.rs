@@ -7,6 +7,7 @@
 //! Terminal rendering consumes bounded telemetry independently of execution.
 
 mod scheduler;
+mod parallax;
 
 use std::{
     collections::VecDeque,
@@ -253,6 +254,7 @@ impl Drop for InputMode {
 enum Pane {
     Overview,
     Scheduler,
+    Parallax,
 }
 
 fn navigate(pane: &mut Pane, scheduler: &mut scheduler::SchedulerView, key: KeyEvent) -> bool {
@@ -261,9 +263,11 @@ fn navigate(pane: &mut Pane, scheduler: &mut scheduler::SchedulerView, key: KeyE
     }
     match key.code {
         KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-            *pane = match pane {
-                Pane::Overview => Pane::Scheduler,
-                Pane::Scheduler => Pane::Overview,
+            let backwards=matches!(key.code,KeyCode::Left|KeyCode::BackTab);
+            *pane=match (*pane,backwards) {
+                (Pane::Overview,false)|(Pane::Parallax,true)=>Pane::Scheduler,
+                (Pane::Scheduler,false)|(Pane::Overview,true)=>Pane::Parallax,
+                _=>Pane::Overview,
             };
             true
         }
@@ -318,10 +322,13 @@ fn render_pane(
             tab(" Overview ", pane == Pane::Overview),
             Span::raw(" "),
             tab(" Scheduler ", pane == Pane::Scheduler),
+            Span::raw(" "),
+            tab(" Parallax ",pane==Pane::Parallax),
         ])),
         rows[1],
     );
     match pane {
+        Pane::Parallax => parallax::render(frame,rows[2],metrics.parallax.predictions()),
         Pane::Overview => render_overview(frame, history, rows[2]),
         Pane::Scheduler => {
             scheduler.render(frame, rows[2], history.snapshot, &metrics.scheduler_trace)
@@ -686,7 +693,7 @@ mod tests {
         let scheduler = scheduler::SchedulerView::default();
         let title = "deepseek-ai/DeepSeek-V4.1-Flash · 127.0.0.1:8001";
         let mut headers = Vec::new();
-        for pane in [Pane::Overview, Pane::Scheduler] {
+        for pane in [Pane::Overview, Pane::Scheduler, Pane::Parallax] {
             let mut terminal = Terminal::new(TestBackend::new(150, 35)).unwrap();
             terminal
                 .draw(|frame| render_pane(frame, title, &history, &scheduler, &metrics, pane))

@@ -16,6 +16,7 @@ pub mod execution;
 pub mod grammar;
 pub mod model;
 pub mod offload;
+pub mod parallax;
 mod os;
 #[cfg(feature = "server")]
 pub mod output;

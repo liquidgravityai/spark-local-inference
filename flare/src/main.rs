@@ -31,6 +31,8 @@ mod launch;
 mod orbit;
 #[cfg(unix)]
 mod package_cache;
+#[cfg(unix)]
+mod parallax;
 mod trust;
 #[cfg(windows)]
 mod windows;
@@ -71,6 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .apply(&mut parsed, &matches, &home)
         .map_err(|error| error.to_string())?;
     let mut args = match parsed.command {
+        #[cfg(unix)]
+        cli::Command::Parallax(args) => return parallax::run(args).map_err(|e| e.to_string().into()),
         cli::Command::Run(args) => *args,
         cli::Command::Download(args) => return hub::run_download(args),
         cli::Command::Inspect(args) => return inspect::run(args),
@@ -245,7 +249,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if membership.is_some() {
         cluster::require_transport()?;
     }
-    let options = args.load_options();
+    let parallax_profile = args.parallax_profile.as_ref().map(|path| {
+        let id=authorized.payload_id().ok_or("Parallax catalog binding requires a payload package")?.iter().map(|b|format!("{b:02x}")).collect::<String>();
+        flare_helios::server::parallax::Profile::load(path,&id)
+    }).transpose()?;
+    let mut options = args.load_options();
+    if let Some(path) = &args.parallax_residency {
+        let config: flare_helios::runtime_package::ResidencyOptions =
+            serde_json::from_slice(&std::fs::read(path)?)?;
+        let profile = parallax_profile.as_ref().ok_or("expert residency requires a Parallax profile")?;
+        if config.catalog_id != profile.model.identity || config.canonical != profile.model.experts {
+            return Err("physical residency and predictor catalogs must match exactly".into());
+        }
+        options.parallax_residency = Some(config);
+    }
     let local_devices: Vec<i32> = (0..args.gpus.len() as i32).collect();
     let shape = cluster::Shape::from_flags(args.roce_ring, args.roce_chain);
     let rendezvous = args.rendezvous;
@@ -290,7 +307,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config["api_key"] = key.into();
     config["thinking_token_budget"] = serde_json::json!(configuration.thinking_token_budget());
     phase.finish(config["model_id"].as_str().unwrap_or_default());
-    serve(owner, config, progress, cluster, shape)?;
+    serve(owner, config, progress, cluster, shape, parallax_profile)?;
     #[cfg(unix)]
     if let Some(peers) = launched {
         peers.finish().map_err(|e| e.to_string())?;
@@ -551,6 +568,7 @@ fn serve(
         Vec<flare_helios::execution::RankStream>,
     )>,
     shape: cluster::Shape,
+    parallax_profile: Option<flare_helios::server::parallax::Profile>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: This executable loads a trusted package and retains its resources
     // until the native server confirms every replay stream has drained.
@@ -575,6 +593,26 @@ fn serve(
         "{} token vocabulary",
         bootstrap.model.contract.vocabulary
     ));
+    let mut parallax_profile = parallax_profile;
+    if let Some(profile) = &mut parallax_profile {
+        let phase = progress.phase("Calibrate Parallax transfers", None);
+        // SAFETY: The package owns this idle context; serving has not started.
+        let calibration = unsafe {
+            flare_helios::server::parallax::calibration::measure(manifest.context, manifest.device)
+        };
+        if calibration.usable() {
+            let copy = calibration.host_to_device.as_ref().unwrap();
+            profile.hardware.bandwidth_bytes_per_ns = copy.bandwidth_bytes_per_ns;
+            profile.hardware.transfer_latency_ns = copy.latency_ns;
+            // Synchronous copy timings already include the driver synchronization cost.
+            profile.hardware.synchronization_ns = 0;
+            phase.finish(format!("{:.1} GB/s host to GPU · {:.0} ms calibration", copy.bandwidth_bytes_per_ns, calibration.elapsed_ns as f64 / 1e6));
+        } else {
+            phase.finish("Uncalibrated; observe without placement recommendations");
+        }
+        profile.hardware.transfer_calibration = Some(calibration);
+        profile.validate()?;
+    }
     let phase = progress.phase("Start server", None);
     let context_tokens = bootstrap.model.limits.max_sequence_tokens;
     let server = match unsafe {
@@ -596,6 +634,13 @@ fn serve(
             return Err(error.message.into());
         }
     };
+    if let Some(profile) = parallax_profile {
+        if let Err(error)=server.start_parallax(profile) {
+            let shutdown=server.close();
+            if !shutdown.drained {std::mem::forget(transport);std::mem::forget(owner);}
+            return Err(error.into());
+        }
+    }
     phase.finish(format!(
         "http://{} · {context_tokens} tokens/request",
         server.address()

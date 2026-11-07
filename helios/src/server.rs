@@ -46,6 +46,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
+pub mod parallax;
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -340,6 +341,9 @@ impl Server {
             }
         }
     }
+    pub fn start_parallax(&self, profile: parallax::Profile) -> std::result::Result<(), String> {
+        self.model.metrics().parallax.start_predictions(profile)
+    }
     pub fn address(&self) -> SocketAddr {
         self.address
     }
@@ -382,6 +386,7 @@ impl Server {
             let _ = stop.send(());
         }
         let mut shutdown = self.model.close();
+        self.model.metrics().parallax.close_predictions();
         if let Some(thread) = control.thread.take() {
             match thread.join() {
                 Ok(Ok(())) => {}
@@ -422,6 +427,8 @@ fn router(state: Arc<HttpState>, served_names: &[String], max_body_bytes: usize)
         .route("/v1/responses", post(http::generate).get(http::no_websocket).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/systemone", post(protocol::decisions::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/decisions", post(protocol::decisions::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
+        .route("/v1/parallax/routing", get(parallax_routing))
+        .route("/v1/parallax/predictions", get(parallax_predictions))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -506,6 +513,21 @@ async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderM
         text,
     )
         .into_response()
+}
+
+async fn parallax_predictions(State(state): State<Arc<HttpState>>) -> Response {
+    Json(state.model.metrics().parallax.predictions()).into_response()
+}
+
+async fn parallax_routing(State(state): State<Arc<HttpState>>, uri: Uri) -> Response {
+    let after = match uri.query() {
+        None | Some("") => 0,
+        Some(query) => match query.strip_prefix("after=").and_then(|v| v.parse::<u64>().ok()) {
+            Some(value) => value,
+            None => return error(StatusCode::BAD_REQUEST, "expected ?after=<routing sequence>"),
+        },
+    };
+    Json(state.model.metrics().parallax.snapshot(after, &state.model.config().model_id)).into_response()
 }
 fn readiness_failure(
     message: &'static str,

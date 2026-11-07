@@ -170,6 +170,7 @@ pub struct PromptLogprobs {
 
 #[derive(Debug)]
 pub struct FrameCompletion {
+    pub routing: Option<crate::parallax::RoutingReadout>,
     pub fence: Fence,
     pub graph_index: usize,
     pub timing: ExecutionTiming,
@@ -238,6 +239,7 @@ impl ExecutionTiming {
 }
 
 struct Pending {
+    routing_dispatch_ns: u64,
     logprobs: u64,
     logprob_width: usize,
     logprob_token_ids: Vec<Vec<u32>>,
@@ -250,6 +252,8 @@ struct Pending {
 }
 
 struct Frame {
+    residency_reader: Option<crate::parallax::residency::ReaderLease>,
+    routing: Option<Readback>,
     input: PinnedHost,
     output: PinnedHost,
     confidence: Option<Readback>,
@@ -381,6 +385,7 @@ struct Resources {
 
 /// Thread-bound executor over one borrowed prepared model and its CUDA context.
 pub struct GraphExecutor {
+    residency: Option<crate::parallax::residency::execution::ExecutionGate>,
     manifest: ExecutionManifest,
     pub(super) copy_logprobs: bool,
     resources: Option<Resources>,
@@ -412,6 +417,8 @@ impl GraphExecutor {
     /// Construct rank-local streams without launching any collective graphs.
     pub(super) unsafe fn new_unstarted(manifest: ExecutionManifest) -> Result<Self> {
         manifest.validate()?;
+        let residency = manifest.residency.as_ref().map(|binding| unsafe { binding.claim() })
+            .transpose().map_err(|e| Error::from(e.to_string()))?;
         let upload_capacity = manifest
             .graphs
             .iter()
@@ -426,6 +433,7 @@ impl GraphExecutor {
             let index = frame_index;
             frame_index += 1;
             Ok(Frame {
+                residency_reader: None,
                 input: model.host_buffer(manifest.input_frame_bytes)?,
                 output: model.host_buffer(manifest.completion_bytes())?,
                 logprobs: if manifest.max_top_logprobs()? != 0 {
@@ -459,6 +467,9 @@ impl GraphExecutor {
                 readiness: manifest.buffers.iter().find(|buffer| buffer.name == "readiness_timestamps")
                     .map(|buffer| Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2))
                     .transpose()?,
+                routing: manifest.buffers.iter().find(|buffer| buffer.name == crate::parallax::BUFFER)
+                    .map(|buffer| Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2))
+                    .transpose()?,
                 produced: model.event_with_timing(true)?,
                 started: model.event_with_timing(true)?,
                 transferred: copy.event()?,
@@ -472,6 +483,7 @@ impl GraphExecutor {
             .map(|binding| crate::engram::Transfers::new(binding, &manifest))
             .transpose()?;
         Ok(Self {
+            residency,
             manifest,
             copy_logprobs: true,
             resources: Some(Resources {
@@ -589,6 +601,7 @@ impl GraphExecutor {
             return false;
         };
         self.startup_ready && self.poison.is_none()
+            && self.residency.as_ref().is_none_or(|gate| !gate.paused())
             && resources.frames[self.next_sequence as usize % 2].pending.is_none()
             && !resources
                 .frames
@@ -656,6 +669,8 @@ impl GraphExecutor {
             ))
             .into());
         }
+        self.progress_residency()?;
+        if self.residency.as_ref().is_some_and(|gate| gate.paused()) { return Ok(None); }
         let resources = self
             .resources
             .as_mut()
@@ -716,7 +731,10 @@ impl GraphExecutor {
             }
             bytes / 4
         } else { 0 };
+        frame.residency_reader = self.residency.as_mut().map(|gate| gate.reader())
+            .transpose().map_err(|e| Error::from(e.to_string()))?;
         frame.pending = Some(Pending {
+            routing_dispatch_ns: if frame.routing.is_some() { crate::parallax::now_ns() } else { 0 },
             logprobs,
             logprob_width,
             logprob_token_ids,
@@ -792,6 +810,13 @@ impl GraphExecutor {
                                               buffer.nbytes / 2)?;
                     }
                 }
+                if crate::parallax::consumes(graph.kind) {
+                    if let Some(readback) = &frame.routing {
+                        let buffer = self.manifest.buffer(crate::parallax::BUFFER)?;
+                        readback.enqueue_copy(&resources.copy, buffer.address + index * buffer.nbytes / 2,
+                                              buffer.nbytes / 2)?;
+                    }
+                }
             }
             resources.copy.record(&frame.transferred)
         };
@@ -810,6 +835,7 @@ impl GraphExecutor {
             ))
             .into());
         }
+        self.progress_residency()?;
         let resources = self
             .resources
             .as_mut()
@@ -835,6 +861,11 @@ impl GraphExecutor {
                 self.poison = Some(error.clone());
                 return Err(error);
             }
+        }
+        let residency_generation = frame.residency_reader.as_ref().map(|r| r.generation);
+        if let Some(reader) = frame.residency_reader.take() {
+            // SAFETY: The completed readback event follows the joined graph and all reads.
+            unsafe { reader.complete(); }
         }
         let pending = frame.pending.take().unwrap();
         if crate::engram::consumes(self.manifest.graphs[pending.graph_index].kind) {
@@ -933,7 +964,23 @@ impl GraphExecutor {
                 return Err(error);
             }
         }
+        let routing = if crate::parallax::consumes(self.manifest.graphs[pending.graph_index].kind) {
+            frame.routing.as_ref().map(|readback| {
+                let buffer = self.manifest.buffer(crate::parallax::BUFFER).expect("validated routing output");
+                // SAFETY: transferred covers this retained frame; decoding finishes before reuse.
+                let result = crate::parallax::decode(unsafe { readback.bytes() }, buffer.shape[1],
+                    buffer.shape[2] - crate::parallax::HEADER, pending.fence.0,
+                    pending.routing_dispatch_ns, crate::parallax::now_ns());
+                // Telemetry content errors are counted independently, never model failures.
+                result.map_or(crate::parallax::RoutingReadout::Invalid, |mut sample| {
+                    sample.residency_generation = residency_generation;
+                    sample.gpu_ns = Some(elapsed_ns);
+                    crate::parallax::RoutingReadout::Valid(sample)
+                })
+            })
+        } else { None };
         Ok(Some(FrameCompletion {
+            routing,
             fence: pending.fence,
             graph_index: pending.graph_index,
             timing: ExecutionTiming {
@@ -990,11 +1037,24 @@ impl GraphExecutor {
         }))
     }
 
+    fn progress_residency(&mut self) -> Result<()> {
+        if let Some(gate) = &mut self.residency {
+            // SAFETY: This executor is the sole graph submitter. Pending frames
+            // retain reader leases; publication waits until their fences finish.
+            if let Err(error) = unsafe { gate.tick(crate::parallax::now_ns()) } {
+                let error = Error::from(format!("expert residency failed: {error}"));
+                self.poison = Some(error.clone());
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub fn close(&mut self) -> Shutdown {
         if let Some(shutdown) = &self.shutdown {
             return shutdown.clone();
         }
-        let resources = self.resources.take().unwrap();
+        let mut resources = self.resources.take().unwrap();
         if let Some(engram) = &resources.engram {
             engram.cancel();
         }
@@ -1012,6 +1072,12 @@ impl GraphExecutor {
             .or(engram.err())
             .or(self.poison.take());
         if drained {
+            for frame in &mut resources.frames {
+                if let Some(reader) = frame.residency_reader.take() {
+                    // SAFETY: Both execution streams and auxiliary transfers have drained.
+                    unsafe { reader.complete(); }
+                }
+            }
             drop(resources);
         } else {
             std::mem::forget(resources);

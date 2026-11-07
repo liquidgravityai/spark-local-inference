@@ -672,7 +672,7 @@ def test_collective_tuning_plan_recipe_default_and_override(mode):
 def test_every_recipe_passes_collective_policy_to_preparation(monkeypatch, tmp_path, recipe, mode):
     from importlib import import_module
 
-    bootstrap = import_module(f"ignition.recipes.{recipe.name}.bootstrap")
+    bootstrap = import_module(recipe.prepare.__module__.rsplit(".", 1)[0] + ".bootstrap")
     assert recipe.collective_tuning == "static"
     assert bootstrap.PreparationConfig.__dataclass_fields__["collective_tuning"].default == "static"
     from ignition.preparation.collective_ladder import load
@@ -757,3 +757,53 @@ def test_moe_decode_a16_geometry_and_rebuild_metadata(monkeypatch):
         replace(ordinary, gpus=tuple(gpu(i, 95) for i in range(4)), force_moe_decode_a16=True)
     with pytest.raises(UsageError, match="mixed-prefill"):
         replace(ordinary, mixed_prefill=True, force_moe_decode_a16=True)
+
+
+@pytest.mark.parametrize("world, default", [(1, "csf"), (2, "csf"), (4, None)])
+def test_glm_expert_scale_selection_and_memory(world, default):
+    from ignition.recipes.glm53.recipe import RECIPE
+
+    checkpoint = RECIPE.checkpoints[0]
+    gpus = tuple(gpu(i, 256) for i in range(world))
+    def make(mode=None):
+        return planning.fit(RECIPE, checkpoint, gpus, concurrency=1, reserve_bytes=0,
+                            speculation=None, expert_scale_compression=mode)
+    automatic, compact, native = make(), make("csf"), make("native")
+    assert automatic.expert_scale_compression == default
+    assert compact.expert_scale_compression == "csf"
+    assert native.expert_scale_compression is None
+    assert compact.weights_bytes < native.weights_bytes
+    assert native.weights_bytes - compact.weights_bytes == 8_704_307_808 // world
+    assert automatic.weights_bytes == (compact if default == "csf" else native).weights_bytes
+
+
+@pytest.mark.parametrize("world, mode", [(1, "csf"), (1, "native"), (4, "csf"), (4, "native")])
+def test_glm_preparation_uses_selected_scale_representation(monkeypatch, world, mode):
+    from ignition.preparation import rank_group
+    from ignition.recipes.glm53 import bootstrap, recipe
+
+    checkpoint = recipe.RECIPE.checkpoints[0]
+    plan = planning.fit(recipe.RECIPE, checkpoint, tuple(gpu(i, 256) for i in range(world)),
+                        concurrency=1, reserve_bytes=0, speculation=None, expert_scale_compression=mode)
+    monkeypatch.setattr(bootstrap, "prepare_rank", lambda snapshot, config, **kwargs: config)
+    monkeypatch.setattr(rank_group, "prepare_group", lambda snapshot, config, *args, **kwargs: config)
+    config = recipe.prepare(None, plan, compile_forwards=False, kernel_cache=None, progress=None)
+    assert config.expand_expert_scales is (mode == "native")
+
+
+@pytest.mark.parametrize("world", (1, 2, 4))
+def test_lil_glm_defaults_to_resident_scales_and_allows_explicit_csf(world):
+    from ignition.recipes import resolve
+
+    model = resolve("lil-glm-5.3-flash")
+    def make(mode=None):
+        return planning.fit(model.recipe, model.checkpoint, tuple(gpu(i, 256) for i in range(world)),
+                            concurrency=1, reserve_bytes=0, speculation=None, expert_scale_compression=mode)
+    automatic, native, compact = make(), make("native"), make("csf")
+    assert automatic.expert_scale_compression is None
+    assert native.expert_scale_compression is None
+    assert compact.expert_scale_compression == "csf"
+    assert automatic.weights_bytes == native.weights_bytes
+    assert compact.weights_bytes < native.weights_bytes
+    assert automatic.recipe.name == "lil_glm53"
+    assert automatic.recipe.prepare is resolve("glm-5.3-flash").recipe.prepare

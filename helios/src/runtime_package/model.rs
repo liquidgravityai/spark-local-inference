@@ -276,6 +276,18 @@ impl NativeModel {
         if device_labels.len() != devices.len() {
             return Err(invalid("GPU label count must match selected devices"));
         }
+        let residency_regions = if let Some(config) = &options.parallax_residency {
+            config.validate()?;
+            if devices.len() != 1 || options.cluster_rank.is_some() || !options.parallax_routing {
+                return Err(invalid("expert residency requires local TP1 Parallax execution"));
+            }
+            match &authorized.kind {
+                AuthorizedKind::Payload(package) => Some(config.storage.resolve(
+                    package.verified_metadata(), &config.canonical, 1,
+                ).map_err(|e| invalid(e.to_string()))?),
+                _ => return Err(invalid("expert residency requires authenticated prepared weight views")),
+            }
+        } else { None };
         let phase = progress.phase("Prepare model", None);
         let (mut descriptor, mut ready_packages, files) = match authorized.kind {
             AuthorizedKind::Legacy { archive, index } => (index, None, FilesRef::Legacy(archive)),
@@ -675,7 +687,15 @@ impl NativeModel {
                     .map(|rank| rank.memory_snapshot())
                     .collect::<Result<Vec<_>>>()?,
             };
+            if let (Some(config), Some(regions)) = (&options.parallax_residency, &residency_regions) {
+                model.ranks[0].plan_residency(&packages[0], config, regions)?;
+            }
             model.check_memory_limit(&packages, options, &initial, embedding_host_bytes)?;
+            // Budget admission precedes physical allocation. Reservations cover all ranks.
+            model.ranks[0].reserve(&packages[0])?;
+            if let (Some(config), Some(regions)) = (&options.parallax_residency, residency_regions) {
+                model.ranks[0].prepare_residency(&packages[0], config, regions)?;
+            }
             let (mut gpu_bytes, mut host_bytes, mut payload_bytes) = (0u64, 0u64, 0u64);
             for allocation in packages.iter().flat_map(|package| &package.allocations) {
                 match allocation.memory {
@@ -685,9 +705,9 @@ impl NativeModel {
                 }
                 payload_bytes += allocation.stored_bytes() as u64;
             }
+            gpu_bytes = gpu_bytes - model.ranks[0].parallax_device_bytes_removed + model.ranks[0].parallax_pool_bytes;
+            host_bytes += model.ranks[0].parallax_device_bytes_removed;
             let phase = progress.phase("Allocate model memory", Some(gpu_bytes + host_bytes));
-            // Reservations cover all ranks and must exist before parallel mapping.
-            model.ranks[0].reserve(&packages[0])?;
             model.parallel(&packages, &files, |rank, package, _| {
                 rank.allocate(package, &phase)
             })?;
@@ -705,6 +725,11 @@ impl NativeModel {
                 "{:.1} GiB",
                 payload_bytes as f64 / (1u64 << 30) as f64
             ));
+            if let Some(config) = &options.parallax_residency {
+                let phase = progress.phase("Place expert weights", None);
+                model.ranks[0].finish_residency(config)?;
+                phase.finish("Grace backing and HBM residency ready");
+            }
             model.grant_peer_access(&descriptor.peer_memory)?;
             let kernels = packages
                 .iter()
@@ -930,6 +955,7 @@ impl NativeModel {
             .map(|(index, rank)| {
                 let mut manifest = rank.execution_manifest()?;
                 manifest.offload = self.offload.binding(index);
+                manifest.residency = rank.parallax.clone();
                 if let Some((shared, delivery_rank)) = self.engram.get(index) {
                     let events = shared
                         .index

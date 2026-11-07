@@ -23,7 +23,7 @@ import torch
 
 
 class Resources:
-    def __init__(self, native, token_capacity=16, verification_width=1):
+    def __init__(self, native, token_capacity=16, verification_width=1, *, routing_trace=False):
         fields = 16 + token_capacity
         self.buffers = {
             "frame_index": torch.zeros(1, dtype=torch.int32, device="cuda"),
@@ -40,9 +40,26 @@ class Resources:
         self.pool = torch.cuda.graph_pool_handle()
         self.graphs = []
         self.finalizer = None
+        trace = None
+        if routing_trace:
+            from ignition.components.routing_trace import RoutingTrace
+
+            self.buffers["parallax_routes_v1"] = torch.zeros((2, 45, 292), dtype=torch.int64, device="cuda")
+            self.route_ids = (torch.arange(32 * verification_width, dtype=torch.int32,
+                device="cuda").reshape(4 * verification_width, 8) % 288)
+            self.route_tokens = [torch.tensor([count * verification_width], dtype=torch.int32,
+                device="cuda") for count in (2, 4)]
+            trace = RoutingTrace(self.buffers["parallax_routes_v1"],
+                self.buffers["frame_index"], self.buffers["submission_sequence"])
+            counters = [[trace.counter(layer, self.route_ids, valid) for layer in range(3, 45)]
+                        for valid in self.route_tokens]
 
         def launch(index):
             buffer, output, active = self.buffers, self.scratch[index], self.active[index]
+            if trace is not None:
+                trace.begin()
+                for counter in counters[index]:
+                    counter()
             self.consumed.index_add_(0, buffer["slots"], active * verification_width)
             output.zero_()
             output[:, 0].copy_(buffer["generations"])
@@ -79,7 +96,7 @@ class Resources:
         context, device = native.current_context()
         offset, bindings = 0, []
         for name, tensor in self.buffers.items():
-            if name == "completion_records":
+            if name in ("completion_records", "parallax_routes_v1"):
                 continue
             offset = (offset + 7) // 8 * 8
             bindings.append({"buffer_name": name, "host_offset": offset, "nbytes": tensor.numel() * tensor.element_size()})

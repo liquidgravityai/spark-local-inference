@@ -394,6 +394,7 @@ explicit flags take precedence.
 | `--speculative-method {mtp,dflash2}` | Select the recipe's learned proposal method. Flash Next defaults to MTP and also supports its pinned DFlash2 checkpoint; Qwen3.8 dense uses DFlash2. Overrides `[models."MODEL"] speculative_method`, then `[defaults] speculative_method`. The selection is recorded in preparation and rebuild metadata; native serving replays the exported graphs. | Recipe declaration |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
 | `--draft-head-quantization {nvfp4,mxfp8}` | Prepare a separate proposal vocabulary head while retaining target-head precision. NVFP4 supports DeepSeek V4/V4.1; MXFP8 supports DeepSeek V4.1. Qwen3.8 dense supports both when the source checkpoint head is BF16, including `qwen3.8-27b-qad`; the packed NVIDIA head cannot be converted through this option. Flash Next supports both with `--speculative-method dflash2` and a BF16 target vocabulary head. This does not quantize the draft body. | Checkpoint precision |
+| `--parallax-routing` | Prepare counter-free and traced target graphs for the [Parallax evaluator](parallax.md), including MTP when selected. Requires `glm53` or `lil_glm53` on one GPU. Telemetry stays disabled until explicitly enabled by the serving command. | off |
 | `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Each complete speculative program records its actual proposal depth independently of target width and aggregate rows. Prefix selection uses measured complete-program cost and completed acceptance or confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
 | `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | 128 except Gemma 4, which derives it from concurrency and draft depth (6 at its defaults) |
 | `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for packed recipes |
@@ -652,6 +653,9 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
 | `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise package serving reserve |
 | `--mtp-draft-tokens N` | Reduce the maximum draft count; zero selects ordinary execution without draft generation, absorption, or draft-state maintenance | Package default |
+| `--parallax-routing` | Select prepared routing telemetry variants. Requires one rank and complete traced graph coverage for the selected ordinary or MTP mode. Older packages with only ordinary traced graphs reject MTP tracing. Startup selection requires no recapture; omit the flag to serve without counters or routing readback. | off |
+| `--parallax-profile PATH` | Select and configure compiled in-process prediction providers for the [native shadow subsystem](parallax-demo.md). Requires `--parallax-routing`; no Python runtime is used. | off |
+| `--parallax-residency PATH` | Configure experimental GB300 Grace/HBM expert storage from authenticated prepared weight views. Requires `--parallax-profile` and complete routing coverage for the selected execution mode. See [residency configuration](parallax.md#connecting-storage-to-serving). | off |
 | `--mtp-adaptive-verification` / `--no-mtp-adaptive-verification` | Adaptive or fixed selection among captured widths | Package default |
 | `--history-drafts` / `--no-history-drafts` | Augment learned drafts with shared decoded-history continuations; requires enabled speculation and captured history inputs, as Qwen Flash provides | Off; package defaults apply unless overridden |
 | `--mtp-adaptive-verification-alpha ALPHA` | Positive finite exponent on completed prefix-survival scheduling scores; below 1 favors longer verification prefixes | `1.0` |
@@ -1771,3 +1775,10 @@ lease and then runs the normal package inspection path, so
 `--json`, `--unverified`, `--publisher-keys`, `--trust-store`, `--rank`,
 `--tensor-parallel`, and the section flags keep their established semantics. It does not gain a separate
 verification path.
+
+## Parallax shadow demonstration
+
+`flare parallax --experiment PATH` runs a bounded native shadow session with the
+Flare terminal dashboard. `--plain` disables the interactive display.
+`flare parallax --replay PATH` evaluates a saved native capture without a GPU.
+See [Parallax in Flare](parallax-demo.md) for profiles, lifecycle and limitations.

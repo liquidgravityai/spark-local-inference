@@ -367,6 +367,7 @@ fn rank_json(rank: usize, bundle: &wire::BundleIndex, options: InspectionOptions
             "verify_tokens": g.verify_tokens,
             "draft_source": wire::DraftSource::try_from(g.draft_source).map_or("UNKNOWN", |d| d.as_str_name()),
             "speculation_enabled": g.speculation_enabled,
+            "routing_trace": g.routing_trace,
             "estimated_duration_ns": g.estimated_duration_ns,
             "node_count": bundle.graphs.iter().find(|graph| graph.name == g.name).map(|graph| graph.node_count),
             "edge_count": bundle.graphs.iter().find(|graph| graph.name == g.name).map(|graph| graph.edge_count),
@@ -624,6 +625,7 @@ mod tests {
                 input_frame_bytes: 0,
                 buffers: vec![],
                 graphs: vec![wire::ExecutionGraph {
+                    routing_trace: false,
                     tuned_bindings: vec![],
                     confidence_width: 0,
                     name: "decode_b32".into(),

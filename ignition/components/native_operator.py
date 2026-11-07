@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, fields
+from functools import lru_cache
 
 import torch
 from b12x._lib.scratch import scratch_buffer_spec
@@ -50,11 +51,12 @@ def native_contract(*, component_id: str, query_type: type,
     """
     names = frozenset(field.name for field in fields(query_type))
 
+    @lru_cache(maxsize=128)
     def legal(query):
         values = tuple(_tactic(value) for value in tactics(query))
         if not values:
             raise ValueError(f"{component_id} has no legal tactic for {query}")
-        return values
+        return values, frozenset(values)
 
     def validate_query(query, device):
         if not isinstance(query, query_type):
@@ -63,7 +65,7 @@ def native_contract(*, component_id: str, query_type: type,
     def validate_config(query, config, device):
         if not isinstance(config, NativeConfig):
             raise TypeError(f"{component_id} configs must be NativeConfig")
-        if config.tactic not in legal(query):
+        if config.tactic not in legal(query)[1]:
             raise ValueError(f"{config.tactic!r} is not a legal {component_id} tactic")
 
     return TuningContract(
@@ -77,9 +79,9 @@ def native_contract(*, component_id: str, query_type: type,
         decode_config=NativeConfig.from_config,
         validate_query=validate_query,
         validate_config=validate_config,
-        default_config=lambda query, device: NativeConfig(legal(query)[0]),
+        default_config=lambda query, device: NativeConfig(legal(query)[0][0]),
         knobs=(Knob(name="tactic", values=None),),
-        parameters=lambda query, device: {"tactic": legal(query)},
+        parameters=lambda query, device: {"tactic": legal(query)[0]},
         semantic_version=semantic_version,
     )
 

@@ -15,3 +15,5 @@ mod lifetime;
 #[cfg_attr(target_os = "windows", path = "processes_windows.rs")]
 mod processes;
 mod python;
+#[cfg(feature = "qualification")]
+mod residency_test;

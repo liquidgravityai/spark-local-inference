@@ -38,6 +38,9 @@ for _container, _fields in (
      ('a1_gscale', 'w1_fp4', 'w1_blockscale', 'w1_alphas',
       'a2_gscale', 'w2_fp4', 'w2_blockscale', 'w2_alphas')),
     ('b12x.moe.fused_moe.weights.PreparedExperts', ('_impl',)),
+    ('ignition.components.moe_sm103.TrtllmNvfp4Experts',
+     ('w13', 'w2', 'stored_scales', 'input_global_scale', 'output1_scale',
+      'output1_gate_scale', 'output2_scale', 'gate_alpha', 'gate_beta', 'clamp_limit')),
     # Shared Ignition weight containers: only these fields hold stored weights.
     ('ignition.components.weights.MLPWeights', ('gate_up', 'down')),
     ('ignition.components.weights.GroupedLinearWeights', ('parts',)),
@@ -1609,10 +1612,11 @@ class DirectWeightLoader:
         ``scale_vectors`` supplies up/gate and down global multipliers followed
         by their activation reciprocal scales. Gate/up scalar compatibility is
         the recipe's responsibility. ``a4_prefill=True`` retains calibrated A4
-        prefill execution on the A16 packed weight owner. Without ``scale_scratch`` (and always on
-        SM103) the CSF scales expand once here into persistent storage. With it,
-        each call expands them into the scratch, which serialized layers can
-        share; both buffers remain caller-owned through replay.
+        prefill execution on the A16 packed weight owner. Without ``scale_scratch``
+        the CSF scales expand once here into persistent storage. With it,
+        A4 calls expand them into scratch that serialized layers can share; both
+        buffers remain caller-owned through replay. SM103 A16 keeps expanded
+        scales resident in its distinct MMA layout.
         """
         import torch
         from b12x.moe import fused_moe as moe
@@ -1629,8 +1633,8 @@ class DirectWeightLoader:
         from .sm103 import is_sm103
 
         sm103 = is_sm103(self.device)
-        # Expanding once at load spends the expanded scales' memory to keep the expansion,
-        # its scratch writes and their rereads off every forward's critical path.
+        # SM103 consumes row-permuted scales. Decode temporarily for lossless layout
+        # preparation; A4 experts retain compact payloads when scratch is supplied.
         expand = sm103 or scale_scratch is None
         if a4_prefill and (sm103 or activation_mode != "a16"):
             raise ValueError("calibrated A4 prefill requires SM120/121 packed NVFP4 A16 experts")
@@ -1689,7 +1693,8 @@ class DirectWeightLoader:
                 expand_source_scales(source, expanded[-1], swizzled=not sm103)
             if sm103:
                 return _sm103_fp4_experts(w13, expanded[0], w2, expanded[1], scale_vectors, format="nvfp4",
-                                          activation_mode=activation_mode, swiglu_limit=swiglu_limit)
+                                          activation_mode=activation_mode, swiglu_limit=swiglu_limit,
+                                          scale_scratch=scale_scratch if activation_mode == "a4" else None)
             block_scales = expanded
         else:
             block_scales = scale_scratch
@@ -1751,14 +1756,15 @@ class DirectWeightLoader:
         return result
 
 
-def _sm103_fp4_experts(w13, s13, w2, s2, scale_vectors, *, format, activation_mode, swiglu_limit):
+def _sm103_fp4_experts(w13, s13, w2, s2, scale_vectors, *, format, activation_mode, swiglu_limit, scale_scratch=None):
     """Prepare packed NVFP4 experts with row-major scales for FlashInfer's SM103 MoE kernels."""
     from .moe_sm103 import prepare_cute_w4a16_experts, prepare_trtllm_nvfp4_experts
 
     if format != "nvfp4":
         raise ValueError("SM103 routed experts support NVFP4 storage")
     if activation_mode == "a4":
-        return prepare_trtllm_nvfp4_experts(w13, s13, w2, s2, scale_vectors, swiglu_limit=swiglu_limit)
+        return prepare_trtllm_nvfp4_experts(w13, s13, w2, s2, scale_vectors,
+                                             swiglu_limit=swiglu_limit, scale_scratch=scale_scratch)
     if activation_mode == "a16":
         return prepare_cute_w4a16_experts(w13, s13, w2, s2, *scale_vectors[:2], swiglu_limit=swiglu_limit)
     raise ValueError(f"SM103 routed experts do not support activation mode {activation_mode!r}")

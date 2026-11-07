@@ -216,7 +216,7 @@ impl NativeResources {
     }
 }
 
-fn fixed_bytes(package: &Package, integrated: bool) -> Result<u64> {
+pub(super) fn fixed_bytes(package: &Package, integrated: bool) -> Result<u64> {
     package
         .allocations
         .iter()
@@ -520,7 +520,7 @@ impl NativeModel {
                         })
                     })?
             } else {
-                fixed_bytes(package, false)?
+                rank.resident_fixed_bytes(package)?
             };
             let current = unsafe { rank.memory_snapshot()? };
             let loaded = fixed
@@ -686,7 +686,7 @@ impl NativeModel {
             } else {
                 (
                     observations[index],
-                    fixed_bytes(package, false)?
+                    rank.resident_fixed_bytes(package)?
                         .max(initial[index].free.saturating_sub(observations[index].free)),
                     offload_bytes,
                     1,

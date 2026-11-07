@@ -82,8 +82,9 @@ class RecurrentBenchmarkInputs:
         self.state_name = "conv_state" if "conv_state" in original else "recurrent_state"
         self.output_name = "out" if "out" in original else "output"
         immutable = {"A_log", "A", "D", "dt_bias", "norm_weight", "conv_weight", "conv_bias"}
-        # Verification records are transient scratch the trials may share with serving.
-        immutable |= {"correction_cache", "kg_cache"}
+        # Serialized trials may share transient destinations with serving. They
+        # are written by the operation, not staged as activation inputs.
+        immutable |= {"correction_cache", "kg_cache", "raw_output"}
         # Recording verification reads one live row per sequence instead of a checkpoint per column.
         self.recording = "correction_cache" in original
         self.packed_source, packed_views = _packed_qkv(original) if "q" in original else (None, {})

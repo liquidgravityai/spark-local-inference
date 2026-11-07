@@ -16,6 +16,7 @@ fn manifest() -> ExecutionManifest {
 
 fn completion(fence: u64, graph: usize) -> FrameCompletion {
     FrameCompletion {
+        routing: None,
         fence: Fence(fence),
         graph_index: graph,
         timing: ExecutionTiming::default(),

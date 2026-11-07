@@ -15,6 +15,7 @@ fn main() {
         let mut runtime = prost_build::Config::new();
         runtime
             .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
+            .field_attribute(".flare.runtime.ExecutionGraph.routing_trace", "#[serde(default)]")
             .file_descriptor_set_path(out.join("runtime_package_descriptor.bin"))
             .field_attribute(".flare.runtime.RebuildSpeculation.vocabulary_parallel_sampling", "#[serde(default)]")
             .field_attribute(

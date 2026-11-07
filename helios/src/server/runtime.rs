@@ -449,6 +449,10 @@ impl ModelRuntime {
         peers: Option<crate::execution::RankPeers>,
         policy: crate::scheduler::PolicyConfig,
     ) -> Result<Self> {
+        manifest.validate()?;
+        if peers.is_some() && manifest.buffers.iter().any(|b| b.name == crate::parallax::BUFFER) {
+            return Err("Parallax routing v1 requires single-rank serving".into());
+        }
         crate::model::catalog::validate(&config, &manifest)?;
         super::observation::initialize_clock();
         if queue_capacity == 0 || queue_capacity > 1024 || !(2..=4096).contains(&event_capacity) {
@@ -480,6 +484,7 @@ impl ModelRuntime {
                 config.completion_token_capacity,
             );
         metrics.history_drafts = config.history_drafts;
+        metrics.parallax.configure(&manifest);
         metrics.engram = manifest
             .engram
             .as_ref()
@@ -1558,6 +1563,10 @@ impl<'a> Worker<'a> {
             .progress(prefill, generated.len(), accepted, draft_rounds,
                 verification_drafts, verification_rounds);
         self.metrics.replay_completed(completion.timing);
+        if let Some(routing) = completion.routing.take() {
+            self.metrics.parallax.publish(routing, completion.graph_index, kind,
+                measured_step.lanes.len(), self.scheduler.stats().active_requests);
+        }
         if prefill > 0 && self.store.is_some() {
             self.observe_prefill_rate(completion.fence, prefill);
         }

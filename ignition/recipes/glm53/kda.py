@@ -61,7 +61,9 @@ class KDAScratch:
 class PreparedGlmKDA:
     """One rank's KDA branch before the row-parallel output reduction.
 
-    Decode and prefill use b12x recurrence kernels. Prefill output normalization
+    Ordinary SM103 decode races b12x against packed FP32 recurrence followed by
+    gated RMS normalization during preparation. Other decode and prefill use
+    b12x recurrence kernels. Prefill output normalization
     fuses the canonical sigmoid-gated FP32 RMSNorm and zeroes inactive rows. Device
     metadata selects live rows and persistent state slots; zero live counts are
     required while preparing and tuning kernels.
@@ -94,7 +96,7 @@ class PreparedGlmKDA:
         if records is not None and mode != "decode":
             raise ValueError("KDA verification records belong to decode rounds")
         self.module, self.weights, self.scratch = module, weights, scratch
-        self.records = self.verification = None
+        self.records = self.verification = self.ordinary = None
         self.state, self.metadata, self.mode = state, metadata, mode
         module.o_norm.weight = torch.nn.Parameter(weights["o_norm.weight"], requires_grad=False)
         self.projections = {}
@@ -182,6 +184,14 @@ class PreparedGlmKDA:
                 checkpoint_state_indices=metadata.checkpoint_state_indices, checkpoint_offsets=metadata.checkpoint_offsets)
             self.recurrent_plan = kda_prefill.plan(caps, invocation=kda_prefill.invocation_from_tensors(**args))
             public_bind, bind_method = kda_prefill.bind, "bind"
+        if mode == "decode" and records is None and self.columns == 1 and sm103.is_sm103(self.device):
+            from ignition.components.kda_decode_preparation_sm103 import PreparedKDADecode
+
+            self.ordinary = PreparedKDADecode(self.recurrent_plan, args,
+                scratch.recurrence.view(self.tokens, self.heads, 128), session=session,
+                name=f"{name}.{mode}", workspace=workspace, eps=module.layer_norm_epsilon)
+            self.recurrent_plan = self.ordinary.plan
+            return
         self.recurrence = prepare_sequence_binding(self.recurrent_plan, args,
             session=session, name=f"{name}.{mode}", public_bind=public_bind, bind_method=bind_method,
             mode=mode, workspace=workspace, run_options=self.options,
@@ -213,6 +223,8 @@ class PreparedGlmKDA:
             m = self.metadata
             _record([s.convolved_qkv, s.raw_g, s.raw_beta, s.z, self.state.recurrent, m.query_start_loc,
                      m.state_indices, m.num_seqs, m.num_tokens], s.gated, *self.records, self.handle)
+        elif self.ordinary is not None:
+            self.ordinary()
         elif self.mode == "decode":
             gdn_decode.run_kda(self.recurrence, **self.options)
         else:

@@ -68,6 +68,7 @@ class PreparedGlmMoe:
             router_plan=self.routing.plan,
             a4_prefill=prefill and weights.experts_a4_prefill)
         self.concurrent_shared = None
+        self.routing_counter = None
         if source.shape[0] <= 256 and workspace.overlap:
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,
                 parallel_plans=(self.routing.plan, self.experts.plan),
@@ -80,6 +81,8 @@ class PreparedGlmMoe:
         if self.concurrent_shared is not None:
             self.concurrent_shared.start(source)
         self.routing(self.scratch.router_logits)
+        if self.routing_counter is not None:
+            self.routing_counter()
         routed = self.experts()
         shared = (self.shared(source) if self.concurrent_shared is None
                   else self.concurrent_shared.finish(source, routed))

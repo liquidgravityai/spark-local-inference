@@ -98,7 +98,7 @@ impl NativeResources {
         let manifest = ExecutionManifest {
             tuning_graphs,
             collectives: None,
-            engram: None,
+            residency: None, engram: None,
             cache: self.cache.clone(),
             offload: None,
             abi_version: execution.abi_version,

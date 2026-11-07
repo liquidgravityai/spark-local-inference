@@ -41,6 +41,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     drafting = {} if speculation is None else {
         "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity, "speculative_fixed_width": speculation.fixed_width}
     config = PreparationConfig(collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
+        parallax_routing=plan.parallax_routing,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
@@ -55,7 +56,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         expert_activation="a4" if any(gpu.capability == (10, 3) for gpu in plan.gpus) else "a16",
         # Expanded scales take 2 x 288 x 4096 x 2048 / 16 bytes per routed layer over the ranks: about
         # 4.9 GB per rank at TP4, which GB10 holds beside its weights, but 9.7 GB at TP2, which it does not.
-        expand_expert_scales=plan.world_size >= 4,
+        expand_expert_scales=plan.expert_scale_compression is None,
         mtp=speculation is not None, **drafting)
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
@@ -78,11 +79,14 @@ RECIPE = Recipe(
         revision="76348ddb2be2e35e39ecfc00e75dc07703f4f3d5", architecture="Glm5NextForConditionalGeneration",
         stored_bytes=177_421_592_008,
         # Language model, draft layer, output head, and replicated vision tower.
-        device_bytes=177_421_592_008,
+        device_bytes=186_125_899_816,
+        # One shared expansion workspace is included in the graph estimate.
+        scale_compressed_device_bytes={"csf": 177_421_592_008},
         # Decoder layer 45, the MTP module.
         draft_bytes=4_301_658_112),),
     context=1048576, page_tokens=256, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0,
+    expert_scale_compression_by_rank=MappingProxyType({1: "csf", 2: "csf", 4: None}),
     # Shared experts, KDA gate projections, and decode query chains run on an auxiliary stream.
     stream_overlap=True, max_images=4, image_bytes=32 << 20, language_model_only=True,
     ranks=MappingProxyType({

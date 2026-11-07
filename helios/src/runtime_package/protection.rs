@@ -224,6 +224,14 @@ pub struct AuthorizedPackage {
 }
 
 impl AuthorizedPackage {
+    /// Signed payload identity for binding model-specific observation catalogs.
+    pub fn payload_id(&self) -> Option<[u8; 32]> {
+        match &self.kind {
+            AuthorizedKind::Payload(package) => Some(package.source.authorized.verified().package_id()),
+            AuthorizedKind::Legacy { .. } => None,
+        }
+    }
+
     /// Canonical model ID followed by serving aliases from the signed serving contract.
     pub fn model_names(&self) -> Result<Vec<&str>> {
         let contract = match &self.kind {
@@ -2599,6 +2607,10 @@ impl PayloadVerifiedPackage {
 }
 
 impl PayloadAuthorizedPackage {
+    pub(super) fn verified_metadata(&self) -> &payload_auth::VerifiedPackage {
+        self.source.authorized.verified()
+    }
+
     pub(super) fn cluster(&self) -> Option<wire::Cluster> {
         self.source
             .authorized

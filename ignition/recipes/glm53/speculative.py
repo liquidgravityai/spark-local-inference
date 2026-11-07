@@ -4,6 +4,8 @@
 
 """Captured GLM proposals, packed target verification and accepted state commits."""
 
+from copy import copy
+
 import torch
 import triton
 import triton.language as tl
@@ -139,6 +141,11 @@ class PreparedPrefill:
         self.indices = torch.arange(tokens, device=device)
         self.before = torch.zeros(1, dtype=torch.int64, device=device)
 
+    def with_routing_trace(self, trace):
+        traced = copy(self)
+        traced.generation = self.generation.with_routing_trace(trace)
+        return traced
+
     def rebind_pages(self, pages):
         self.absorb.rebind_pages()
         self.generation.rebind_pages(pages)
@@ -209,6 +216,13 @@ class PreparedRound:
         self.tail_backup = torch.empty_like(o.pool.draft.index.tail[:b])
         self.broadcast_buffers, self.name = buffers, name
         self.operations = None
+
+    def with_routing_trace(self, trace):
+        # Proposals and accepted-state commits retain their original operators.
+        # Target counts include every verified candidate, including rejected drafts.
+        traced = copy(self)
+        traced.decoder = self.decoder.with_routing_trace(trace)
+        return traced
 
     def prepare(self):
         if self.operations is not None:

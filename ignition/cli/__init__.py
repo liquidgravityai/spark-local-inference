@@ -203,6 +203,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " kernel tuning (default: see MODEL --help)")
     from .config import AUTOTUNE_EFFORTS
 
+    advanced.add_argument("--parallax-routing", action="store_true",
+                          help="prepare optional Parallax routing graphs (GLM-Flash, one GPU; runtime activation required)")
+
     advanced.add_argument("--autotune-effort", choices=AUTOTUNE_EFFORTS,
                           help="kernel search effort: off uses heuristics without races; default races"
                                " the pruned candidate set; audit lifts the performance exclusions to"

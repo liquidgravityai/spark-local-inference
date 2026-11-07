@@ -119,12 +119,16 @@ class PreparedMHC:
             raise ValueError("lagged mHC requires incoming and outgoing coefficient buffers")
         if pre_mix is not None:
             self.options.update(pre_mix=pre_mix)
-        self.composed = self.row_calls = None
-        if pre_mix is None and tokens > mhc_sm103.MIN_ROWS and sm103.is_sm103(residual.device):
-            # SM103 prefill composes FlashInfer's mHC kernels; b12x's fused launches stay for decode.
-            self.composed = mhc_sm103.ComposedMHC(self.operation, weights, scratch, rms_eps=rms_eps,
-                hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps)
-            return
+        if sm103.is_sm103(residual.device):
+            from b12x.norm.mhc._alias import overlaps
+
+            live = (weights.fn, weights.scale, weights.base, weights.norm,
+                    scratch.residual, scratch.post, scratch.comb, pre_mix, pre_out)
+            if pre_mix is not None:
+                live += tuple(inputs)
+            if any(overlaps(scratch.normalized, value) for value in live if value is not None):
+                raise ValueError("SM103 mHC normalized output must not overlap live weights, residuals or mixing buffers")
+        self.composed = self.row_calls = self.ordered_post = self.rounded_norm = None
         if max_rows_per_call is not None and tokens > max_rows_per_call:
             self.row_calls = []
             for start in range(0, tokens, max_rows_per_call):
@@ -138,8 +142,37 @@ class PreparedMHC:
                     pre_out=None if pre_out is None else pre_out[start:end])
                 self.row_calls.append((start, end, call))
             return
+        if pre_mix is None and tokens > mhc_sm103.MIN_ROWS and sm103.is_sm103(residual.device):
+            self.composed = mhc_sm103.ComposedMHC(self.operation, weights, scratch, rms_eps=rms_eps,
+                hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps)
+            return
+        if pre_mix is None and sm103.is_sm103(residual.device):
+            self.composed = mhc_sm103.ExactMHC(self.operation, inputs, weights, scratch,
+                rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps)
+            return
+        if self.operation == "post_pre" and sm103.is_sm103(residual.device):
+            # b12x post/pre adds the branch before the residual reduction, changing BF16 rounding.
+            self.mixed_residual = mhc_sm103.mixed_residual_scratch(residual)
+            self.ordered_post = mhc_sm103.OrderedMHCPost(*inputs, self.mixed_residual)
+            self.pre_call = PreparedMHC((self.mixed_residual,), weights, scratch,
+                session=session, name=f"{name}.pre", workspace=workspace,
+                rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters,
+                norm_eps=norm_eps, pre_mix=pre_mix, pre_out=pre_out)
+            return
+        native_scratch = scratch
+        if sm103.is_sm103(residual.device):
+            from ignition.components.mhc_norm_sm103 import prepare as prepare_norm
+
+            # Lagged normalization uses incoming coefficients and rounds collapse to BF16.
+            self.options["norm_weight"] = None
+            native_scratch = MHCScratch(scratch.residual, scratch.post, scratch.comb,
+                                       mhc_sm103.collapsed_scratch(residual))
+            self.rounded_norm = prepare_norm(
+                scratch.residual,
+                weights.norm, scratch.normalized, eps=norm_eps, coefficients=pre_mix)
+        self.native_scratch = native_scratch
         self.plan = mhc.plan(mhc.Caps(device=residual.device, max_tokens=tokens, hidden_size=hidden),
-            invocation={"operation": self.operation, "output_mode": "provided", "has_norm_weight": True,
+            invocation={"operation": self.operation, "output_mode": "provided", "has_norm_weight": self.rounded_norm is None,
                 "norm_weight_dtype": str(weights.norm.dtype).removeprefix("torch."),
                 "expanded_residual": self.operation == "pre",
                 "rms_eps": rms_eps, "hc_eps": hc_eps, "sinkhorn_iters": sinkhorn_iters, "norm_eps": norm_eps,
@@ -166,12 +199,12 @@ class PreparedMHC:
             fixture = benchmark_inputs()
             return call(state, fixture.inputs, fixture.scratch, fixture)
 
-        declare(session, (self.plan.request(name=name, prepare_call=lambda state: call(state, inputs, scratch),
+        declare(session, (self.plan.request(name=name, prepare_call=lambda state: call(state, inputs, native_scratch),
                                           benchmark_call=benchmark),))
 
         def finalize():
             self.binding = mhc.bind(self.plan, scratch=planned_scratch(self.plan.scratch_specs(), workspace),
-                                    tokens=tokens, pre_out=pre_out, **scratch.bind_args())
+                                    tokens=tokens, pre_out=pre_out, **native_scratch.bind_args())
 
         register_finalizer(session, finalize, workspace=workspace)
 
@@ -182,15 +215,24 @@ class PreparedMHC:
             for start, end, call in self.row_calls:
                 call(*(value[start:end] for value in inputs))
             return self.scratch.normalized
+        if self.ordered_post is not None:
+            self.ordered_post(*inputs)
+            return self.pre_call(self.mixed_residual)
         entry = mhc.run_pre if self.operation == "pre" else mhc.run_post_pre
         entry(*inputs, self.weights.fn, self.weights.scale, self.weights.base,
               **self.options, binding=self.binding)
+        if self.rounded_norm is not None:
+            self.rounded_norm()
         return self.scratch.normalized
 
 
 class PreparedMHCPost:
     def __init__(self, source, residual, post, comb, output, *, session, name):
         self.output = output
+        self.ordered_post = None
+        if sm103.is_sm103(residual.device):
+            self.ordered_post = mhc_sm103.OrderedMHCPost(source, residual, post, comb, output)
+            return
         self.plan = mhc.plan(mhc.Caps(device=residual.device, max_tokens=residual.shape[0],
                                      hidden_size=residual.shape[-1]),
                              invocation={"operation": "post", "output_mode": "provided"})
@@ -198,6 +240,8 @@ class PreparedMHCPost:
             run=lambda: _impl._b12x_mhc_post_impl(source, residual, post, comb, out=output, _state=state))),))
 
     def __call__(self, source, residual, post, comb):
+        if self.ordered_post is not None:
+            return self.ordered_post(source, residual, post, comb)
         return mhc.run_post(source, residual, post, comb, out=self.output, plan=self.plan)
 
 
