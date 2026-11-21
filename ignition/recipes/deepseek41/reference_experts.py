@@ -50,7 +50,7 @@ class ReferenceExperts(nn.Module):
 
     @classmethod
     def prepare(cls, weights, rows, *, weight, bias, image_bias, scaling,
-                scoring_func, clamp, session, name):
+                scoring_func, clamp, session, name, compute_sm_count=0):
         """Declare row variants over one layer's residency-owned weight planes."""
         from ignition.components.megamoe import PreparedMegaMoe
 
@@ -66,7 +66,8 @@ class ReferenceExperts(nn.Module):
         padding = torch.zeros(max(rows), dtype=torch.bool, device=device)
         operations = {row: PreparedMegaMoe(example[:row], ids[:row], probabilities[:row], padding[:row],
             weights.routed, weights.shared, workspace=weights.workspace, host_tier=weights.host_tier,
-            host_shared_first=True, clamp=clamp, session=session, name=f"{name}.{row}") for row in rows}
+            host_shared_first=True, clamp=clamp, session=session, name=f"{name}.{row}",
+            compute_sm_count=compute_sm_count) for row in rows}
         return cls(operations, weight=weight, bias=bias, image_bias=image_bias,
                    placement=weights.expert_map.reshape(-1, 1), scaling=scaling, scoring_func=scoring_func)
 

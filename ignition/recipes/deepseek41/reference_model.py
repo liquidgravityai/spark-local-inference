@@ -91,16 +91,26 @@ def declare_reference_weights(model):
 class ReferenceExpertPreparation:
     modules: dict
     weights: dict
+    mover: object | None = None
 
     @classmethod
     def load(cls, checkpoint, placements, *, target_rows, draft_rows=(), storage,
-             kernel_cache, session, host_lane_clusters=4, dspark=True):
+             kernel_cache, session, host_lane_clusters=4, dspark=True,
+             dynamic_mover=None, compute_sm_count=0):
         """Load all target/draft experts into explicit tiers using bounded batches.
 
         The caller owns the native storage context and retains this preparation
         until graph execution drains. Scale expansion preserves checkpoint bits;
         the prepared MegaMoE planes use native scales in both physical tiers.
         """
+        from ignition.components.megamoe_tiers import MegaMoeDynamicHostTier, MegaMoeLayerWeights
+        from ignition.components.megamoe_weights import (
+            allocate_mxfp4_weights, load_mxfp4_weights_into,
+            load_shared_fp8_planes, pack_shared_fp8_planes,
+        )
+        from ignition.components.sm103_expert_mover import SM103ExpertMoverRuntime
+        from ignition.preparation.persistent import persistent_copy
+
         model = ModelConfig.load(checkpoint.source.metadata_path)
         placements = dict(placements)
         required = [f"layers.{i}.ffn" for i in range(model.layers)]
@@ -112,6 +122,7 @@ class ReferenceExpertPreparation:
             raise ValueError("reference preparation requires row capacities for every enabled expert group")
         device = torch.device("cuda", storage.device)
         workspaces, modules, owners = {}, {}, {}
+        dynamic_layers = []
         for name in required:
             draft = name.startswith("mtp.")
             rows = tuple(draft_rows if draft else target_rows)
@@ -119,30 +130,77 @@ class ReferenceExpertPreparation:
             experts = model.draft.experts if draft else model.text["n_routed_experts"]
             if placement.experts != experts:
                 raise ValueError(f"reference placement differs from checkpoint expert count: {name}")
-            geometry = MegaMoeGeometry(placement.physical_rows, max(rows),
+            use_dynamic = dynamic_mover is not None and not draft and bool(placement.host)
+            physical_rows = experts if use_dynamic else placement.physical_rows
+            geometry = MegaMoeGeometry(physical_rows, max(rows),
                 model.draft.top_k if draft else model.text["num_experts_per_tok"],
                 model.text["hidden_size"], model.text["moe_intermediate_size"], model.text["n_shared_experts"])
             if geometry not in workspaces:
                 workspaces[geometry] = MegaMoeWorkspace(geometry, device=device, kernel_cache=kernel_cache)
-            layout = MegaMoeLayerLayout(workspaces[geometry], placement.host, placement.hbm,
-                                        storage, host_lane_clusters)
+            ws = workspaces[geometry]
             with DirectWeightLoader(checkpoint.source, device, prefixes=(name + ".",)) as loader:
-                weights = layout.load(loader, (f"{name}.experts.{i}" for i in range(experts)),
-                    shared_prefix=name + ".shared_experts", block_size=tuple(model.quantization["weight_block_size"]),
-                    projection_names=("w1", "w3", "w2"), name=name)
+                if use_dynamic:
+                    hbm_slots = len(placement.hbm) + dynamic_mover.spare_slots
+                    tier = MegaMoeDynamicHostTier(
+                        ws.geometry, hbm_slots=hbm_slots, initial_hbm_experts=placement.hbm,
+                        storage=storage, name=name,
+                    )
+                    prefixes = [f"{name}.experts.{i}" for i in range(experts)]
+                    load_mxfp4_weights_into(
+                        loader, prefixes, tier.cpu_weights,
+                        hidden_size=ws.geometry.hidden, intermediate_size=ws.geometry.intermediate,
+                        projection_names=("w1", "w3", "w2"), scale_name="scale",
+                    )
+                    routed = allocate_mxfp4_weights(hbm_slots, ws.geometry.hidden, ws.geometry.intermediate, device=device)
+                    for dst, src_cpu in zip((*routed.gate_up, *routed.down), tier.host_views):
+                        for slot, expert_id in enumerate(placement.hbm):
+                            dst[slot].copy_(src_cpu[expert_id].to(device))
+                        dst[len(placement.hbm):].zero_()
+                    shared = pack_shared_fp8_planes(load_shared_fp8_planes(
+                        loader, name + ".shared_experts",
+                        hidden_size=ws.geometry.hidden, intermediate_size=ws.geometry.intermediate,
+                        block_size=tuple(model.quantization["weight_block_size"]),
+                        projection_names=("w1", "w3", "w2"), scale_name="scale",
+                    ))
+                    expert_map = persistent_copy(torch.arange(experts, dtype=torch.int32, device=device))
+                    record_numeric_tensor(expert_map)
+                    weights = MegaMoeLayerWeights(
+                        routed, shared, ws, tier, expert_map,
+                        tuple(range(experts)), placement.hbm,
+                    )
+                    dynamic_layers.append((tier, routed))
+                else:
+                    layout = MegaMoeLayerLayout(ws, placement.host, placement.hbm,
+                                                storage, host_lane_clusters)
+                    weights = layout.load(loader, (f"{name}.experts.{i}" for i in range(experts)),
+                        shared_prefix=name + ".shared_experts", block_size=tuple(model.quantization["weight_block_size"]),
+                        projection_names=("w1", "w3", "w2"), name=name)
                 weight = loader.load_tensor(name + ".gate.weight")
                 bias = loader.load_tensor(name + ".gate.bias")
                 image_bias = loader.load_tensor(name + ".gate.bias_vl") if model.vision is not None else None
             owners[name] = weights
             modules[name] = ReferenceExperts.prepare(weights, rows, weight=weight, bias=bias, image_bias=image_bias,
                 scaling=model.text["routed_scaling_factor"], scoring_func=model.text["scoring_func"],
-                clamp=model.text["swiglu_limit"], session=session, name=name)
+                clamp=model.text["swiglu_limit"], session=session, name=name,
+                compute_sm_count=compute_sm_count)
             if modules[name].placement.data_ptr() != weights.expert_map.data_ptr():
                 raise RuntimeError(f"reference router placement lost its tier mapping alias: {name}")
-        return cls(modules, owners)
+        mover = None
+        if dynamic_layers:
+            mover = SM103ExpertMoverRuntime(
+                dynamic_layers,
+                storage=storage,
+                kernel_cache=kernel_cache,
+                worker_sm_count=dynamic_mover.worker_sm_count,
+                queue_capacity=dynamic_mover.queue_capacity,
+            )
+            mover.attach_predictors(dynamic_mover.predictor_config())
+        return cls(modules, owners, mover=mover)
 
     def close_host_regions(self):
         """Release mapped host weights after every reader and graph has drained."""
+        if self.mover is not None:
+            self.mover.close()
         for weights in self.weights.values():
             if weights.host_tier is not None:
                 for region in weights.host_tier.regions:

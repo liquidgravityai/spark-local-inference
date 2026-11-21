@@ -424,12 +424,28 @@ def _prepare_reference_rank(snapshot, config, *, rank, group, progress=None, cor
     with core_storage.transient():
         before_weights = allocated_tensor_bytes(device)
         with phase(progress, "Load reference model and tiered experts"):
+            compute_sm_count = 0
+            if config.sm103.dynamic_mover is not None:
+                import deep_gemm
+                from ignition.components.sm103_expert_mover import query_green_context_compute_sms
+
+                _, compute_sm_count = query_green_context_compute_sms(
+                    device.index, config.sm103.dynamic_mover.worker_sm_count
+                )
+                deep_gemm.set_num_sms(compute_sm_count)
+                try:
+                    import tile_kernels
+                    if hasattr(tile_kernels, "set_num_sms"):
+                        tile_kernels.set_num_sms(compute_sm_count)
+                except ImportError:
+                    pass
             parameters = ReferenceParameters(checkpoint)
             parameters.load_ordinary(device)
             experts = ReferenceExpertPreparation.load(checkpoint, dict(config.sm103.placements),
                 target_rows=target_rows, draft_rows=draft_rows, storage=core_storage,
                 kernel_cache=config.kernel_cache, session=session,
-                host_lane_clusters=config.sm103.host_lane_clusters, dspark=dspark_loaded)
+                host_lane_clusters=config.sm103.host_lane_clusters, dspark=dspark_loaded,
+                dynamic_mover=config.sm103.dynamic_mover, compute_sm_count=compute_sm_count)
             sequence = torch.zeros(1, dtype=torch.int64, device=device)
             frame = torch.zeros(1, dtype=torch.int32, device=device)
             delivery = ReferenceEngramDelivery.from_checkpoint(checkpoint, parameters.config.gpt,
@@ -544,10 +560,13 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
             sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
             submission_sequence=sequence, **completion.buffers())
-        expert_rows, row_buffers = megamoe_row_storage(
-            (index, experts.weights[f"layers.{index}.ffn"], f"weights.layers[{index}]")
-            for index in range(len(model.model.layers))
-            if experts.weights[f"layers.{index}.ffn"].host_tier is not None)
+        if experts.mover is not None:
+            expert_rows, row_buffers = None, {}
+        else:
+            expert_rows, row_buffers = megamoe_row_storage(
+                (index, experts.weights[f"layers.{index}.ffn"], f"weights.layers[{index}]")
+                for index in range(len(model.model.layers))
+                if experts.weights[f"layers.{index}.ffn"].host_tier is not None)
         buffers.update(row_buffers)
         if vision_state is not None:
             buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
@@ -707,6 +726,12 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
             materialize=materialize, warmup_storage=core_storage,
             compile_kinds=("prefill", "decode", "resume", "speculative", "vision"))
+        persistent_worker = None
+        if experts.mover is not None:
+            persistent_worker = experts.mover.capture_worker_graph(
+                name="sm103_expert_mover", retain_graphs=config.retain_graphs, stream=stream
+            )
+            buffers[experts.mover.control_buffer_name] = experts.mover.control_region.device_view
     finally:
         if feature_pool is not None:
             feature_pool.materialize()
@@ -715,6 +740,8 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
     torch.cuda.synchronize(device)
     for stager in expert_stagers.values():
         stager.decision.zero_()
+    if experts.mover is not None:
+        experts.mover.reset_runtime_state()
     torch.cuda.synchronize(device)
     torch.cuda.empty_cache()
     release_unused()
@@ -781,13 +808,14 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
     if vision_state is not None:
         disposable.append(vision_state.arena)
     prepared = PreparedModel(rebuild_weights=declare_reference_weights(model), expert_rows=expert_rows,
+        persistent_worker=persistent_worker,
         device=config.devices[0], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*storage_ranges(disposable), *completion.zero_ranges()),
         export_events=delivery.export_events(),
         embedding_catalog=delivery.resident_catalog(),
         core_data=delivery,
-        resources=(model, experts, delivery, history, pool, requests, inputs, admission, commands,
+        resources=(model, experts, experts.mover, delivery, history, pool, requests, inputs, admission, commands,
             forwards, compiled, stream, graph_pool, session, rng, proposal_generation, proposal_offset,
             confidence, vision_state, vision_inputs, vision_prefill, feature_pool),
         close_resources=())

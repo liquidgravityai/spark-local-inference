@@ -30,12 +30,75 @@ def _reference_cache_costs(model, *, verification_width, dspark, page_tokens=128
 
 
 @dataclass(frozen=True)
+class DynamicExpertMoverConfig:
+    """Configuration for the SM103 GPU-side persistent expert mover and inline predictor."""
+
+    worker_sm_count: int = 8
+    spare_slots: int = 2
+    queue_capacity: int = 1024
+    decay_shift: int = 4
+    promote_threshold: int = 384
+    hysteresis: int = 64
+    cooldown_steps: int = 2
+    max_enqueues: int = 2
+    max_predict_rows: int = 64
+
+    def __post_init__(self):
+        if any(type(v) is not int for v in vars(self).values()):
+            raise ValueError("dynamic_mover fields must be integers")
+        if not 1 <= self.worker_sm_count < 64:
+            raise ValueError("dynamic_mover worker_sm_count must be in [1, 63]")
+        if self.spare_slots < 1:
+            raise ValueError("dynamic_mover requires at least one spare HBM slot")
+        if self.queue_capacity < 16 or (self.queue_capacity & (self.queue_capacity - 1)) != 0:
+            raise ValueError("dynamic_mover queue_capacity must be a power of two >= 16")
+        if not 0 <= self.decay_shift < 31:
+            raise ValueError("dynamic_mover decay_shift must be in [0, 30]")
+        if self.promote_threshold <= 0:
+            raise ValueError("dynamic_mover promote_threshold must be positive")
+        if self.hysteresis < 0:
+            raise ValueError("dynamic_mover hysteresis must be nonnegative")
+        if self.cooldown_steps < 1:
+            raise ValueError("dynamic_mover cooldown_steps must be at least 1")
+        if not 0 <= self.max_enqueues <= 4:
+            raise ValueError("dynamic_mover max_enqueues must be in [0, 4]")
+        if self.max_predict_rows < 1:
+            raise ValueError("dynamic_mover max_predict_rows must be positive")
+
+    def predictor_config(self):
+        from ignition.components.sm103_expert_mover import PredictorConfig
+
+        return PredictorConfig(
+            decay_shift=self.decay_shift,
+            promote_threshold=self.promote_threshold,
+            hysteresis=self.hysteresis,
+            cooldown_steps=self.cooldown_steps,
+            max_enqueues=self.max_enqueues,
+            max_predict_rows=self.max_predict_rows,
+        )
+
+    def to_dict(self):
+        return {
+            "worker_sm_count": self.worker_sm_count,
+            "spare_slots": self.spare_slots,
+            "queue_capacity": self.queue_capacity,
+            "decay_shift": self.decay_shift,
+            "promote_threshold": self.promote_threshold,
+            "hysteresis": self.hysteresis,
+            "cooldown_steps": self.cooldown_steps,
+            "max_enqueues": self.max_enqueues,
+            "max_predict_rows": self.max_predict_rows,
+        }
+
+
+@dataclass(frozen=True)
 class SM103Config:
     placements: tuple[tuple[str, ExpertPlacement], ...]
     host_lane_clusters: int = 4
     prefill_staging: PrefillExpertStaging | None = None
     execution: str = "reference"
     context: int | None = None
+    dynamic_mover: DynamicExpertMoverConfig | None = None
 
     @classmethod
     def load(cls, path):
@@ -54,7 +117,7 @@ class SM103Config:
         if execution != "reference":
             raise ValueError("SM103 execution must be 'reference'")
         required = {"version", "placements", "host_lane_clusters"}
-        optional = {"execution", "context", "prefill_staging"}
+        optional = {"execution", "context", "prefill_staging", "dynamic_mover"}
         if not required <= set(value) or set(value) - required - optional or not isinstance(value["placements"], dict):
             raise ValueError("SM103 preparation fields do not match reference execution")
         placements = []
@@ -68,8 +131,14 @@ class SM103Config:
             if not isinstance(staging, dict) or set(staging) != {"min_rows", "min_cold_experts"}:
                 raise ValueError("prefill_staging requires min_rows and min_cold_experts")
             staging = PrefillExpertStaging(**staging)
+        mover = value.get("dynamic_mover")
+        if mover is not None:
+            allowed_mover = set(DynamicExpertMoverConfig.__dataclass_fields__)
+            if not isinstance(mover, dict) or set(mover) - allowed_mover:
+                raise ValueError("dynamic_mover contains unsupported fields")
+            mover = DynamicExpertMoverConfig(**mover)
         return cls(tuple(placements), value["host_lane_clusters"], staging,
-                   execution=execution, context=value.get("context"))
+                   execution=execution, context=value.get("context"), dynamic_mover=mover)
 
     def __post_init__(self):
         if (not isinstance(self.placements, tuple) or not self.placements
@@ -87,6 +156,21 @@ class SM103Config:
             raise ValueError("SM103 host lane clusters must be in [0, 75]")
         if self.prefill_staging is not None and not isinstance(self.prefill_staging, PrefillExpertStaging):
             raise ValueError("SM103 prefill staging requires explicit row and cold-demand thresholds")
+        if self.dynamic_mover is not None:
+            if not isinstance(self.dynamic_mover, DynamicExpertMoverConfig):
+                raise ValueError("SM103 dynamic_mover must be a DynamicExpertMoverConfig")
+            if self.prefill_staging is not None:
+                raise ValueError("SM103 dynamic_mover cannot be combined with static prefill_staging")
+            tiered_target = False
+            for name, placement in self.placements:
+                if name.startswith("layers.") and placement.host:
+                    tiered_target = True
+                    if len(placement.hbm) + self.dynamic_mover.spare_slots > placement.experts:
+                        raise ValueError(
+                            f"{name}: HBM active slots plus spare_slots exceeds total canonical experts"
+                        )
+            if not tiered_target:
+                raise ValueError("SM103 dynamic_mover requires at least one tiered target layer with host experts")
 
     def validate_model(self, model, *, dspark):
         expected = {f"layers.{i}.ffn": model.text["n_routed_experts"] for i in range(model.layers)}
@@ -103,6 +187,8 @@ class SM103Config:
             result["prefill_staging"] = self.prefill_staging.to_dict()
         if self.context is not None:
             result["context"] = self.context
+        if self.dynamic_mover is not None:
+            result["dynamic_mover"] = self.dynamic_mover.to_dict()
         return result
 
     def staging_bytes(self, model):
@@ -117,12 +203,20 @@ class SM103Config:
         return 3 * max(rows) * per_expert
 
     def expert_bytes(self, model, *, dspark):
-        """Native packed MXFP4 payload and expanded UE8M0 scales, including copies."""
+        """Native packed MXFP4 payload and expanded UE8M0 scales, including copies and dynamic spare slots."""
         self.validate_model(model, dspark=dspark)
         elements = 3 * model.text["hidden_size"] * model.text["moe_intermediate_size"]
         per_expert = elements // 2 + elements // 32
-        return {tier: sum(len(getattr(placement, tier)) for _, placement in self.placements) * per_expert
-                for tier in ("hbm", "host")}
+        hbm_rows = 0
+        host_rows = 0
+        for name, placement in self.placements:
+            if self.dynamic_mover is not None and name.startswith("layers.") and placement.host:
+                host_rows += placement.experts
+                hbm_rows += len(placement.hbm) + self.dynamic_mover.spare_slots
+            else:
+                host_rows += len(placement.host)
+                hbm_rows += len(placement.hbm)
+        return {"hbm": hbm_rows * per_expert, "host": host_rows * per_expert}
 
     def planning_inputs(self, recipe, checkpoint, snapshot, *, dspark, draft_tokens=None):
         """Estimate native tensor extents from headers, independently of CSF file sizes."""

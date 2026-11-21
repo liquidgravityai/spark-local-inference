@@ -163,6 +163,7 @@ class MegaMoeDynamicHostTier:
         self.hbm_slots = hbm_slots
         self.host_lane_clusters = 0
         self.indirection = True
+        self.predictor_binding = None
         self.regions, self.host_views, self.device_views = [], [], []
         self.plane_row_bytes = []
         labels = ("gate_up", "gate_up_scales", "down", "down_scales")

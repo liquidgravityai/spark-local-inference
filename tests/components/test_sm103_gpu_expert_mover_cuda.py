@@ -141,17 +141,10 @@ def _make_random_shared_fp8(hidden, intermediate, device, gen):
 
 
 @pytest.fixture(scope="module")
-def sm103_storage():
+def sm103_storage(megamoe_core_storage):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (10, 3):
         pytest.skip("SM103 GB300 required")
-    from ignition.preparation.core_storage import CoreStorage
-
-    storage = CoreStorage(rank=0, world=1, device=0)
-    with storage:
-        try:
-            yield storage
-        finally:
-            storage.close()
+    return megamoe_core_storage
 
 
 def test_sm103_indirection_megamoe_bit_exact_under_concurrent_8sm_tma_swaps(sm103_storage):
@@ -647,7 +640,7 @@ def test_sm103_8sm_1d_tma_mover_host_numa_vmm_bandwidth():
             E, S, 0, 0,
         )
         descs = torch.tensor(list(entry) + [0] * (192 - len(entry)), dtype=torch.uint8, device=dev)
-        q_hdr = torch.zeros((64,), dtype=torch.uint8, device=dev)
+        q_hdr = torch.zeros((binding.queue_header_bytes(),), dtype=torch.uint8, device=dev)
         q_hdr[:12].copy_(torch.tensor(list(struct.pack("<III", 0, 0, 1023)), dtype=torch.uint8))
         q_ring = torch.zeros((1024 * 16,), dtype=torch.uint8, device=dev)
 

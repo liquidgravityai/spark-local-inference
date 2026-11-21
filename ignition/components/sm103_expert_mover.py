@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preparation owner and persistent CUDA graph builder for the SM103 GPU expert mover."""
+"""Preparation owner, inline on-GPU predictor state, and persistent graph builder for the SM103 GPU expert mover."""
 
 from __future__ import annotations
 
+import ctypes as C
 from dataclasses import dataclass
 from pathlib import Path
 import struct
@@ -21,6 +22,49 @@ from ignition.preparation.tensor_metadata import record_numeric_tensor
 
 
 @dataclass(frozen=True)
+class PredictorConfig:
+    """Parameters for the inline on-GPU decayed-frequency + LFU/LRU routing predictor."""
+
+    decay_shift: int = 4
+    promote_threshold: int = 384
+    hysteresis: int = 64
+    cooldown_steps: int = 2
+    max_enqueues: int = 2
+    max_predict_rows: int = 64
+
+    def __post_init__(self):
+        if any(type(v) is not int for v in vars(self).values()):
+            raise ValueError("PredictorConfig fields must be integers")
+        if not 0 <= self.decay_shift < 31:
+            raise ValueError("decay_shift must be in [0, 30]")
+        if self.promote_threshold <= 0:
+            raise ValueError("promote_threshold must be positive")
+        if self.hysteresis < 0:
+            raise ValueError("hysteresis must be nonnegative")
+        if self.cooldown_steps < 1:
+            raise ValueError("cooldown_steps must be at least 1")
+        if not 0 <= self.max_enqueues <= 4:
+            raise ValueError("max_enqueues must be in [0, 4]")
+        if self.max_predict_rows < 1:
+            raise ValueError("max_predict_rows must be positive")
+
+
+@dataclass(frozen=True)
+class PredictorLayerBinding:
+    """Per-layer persistent HBM predictor state bound to a MegaMoeDynamicHostTier."""
+
+    layer_idx: int
+    state: torch.Tensor
+    scores: torch.Tensor
+    last_seen: torch.Tensor
+    cooldown: torch.Tensor
+    queue_header: torch.Tensor
+    queue_ring: torch.Tensor
+    metrics_ptr: int
+    metrics_count: int
+
+
+@dataclass(frozen=True)
 class MoverMetrics:
     swaps_completed: int
     bytes_copied: int
@@ -28,17 +72,68 @@ class MoverMetrics:
     skipped_already_resident: int
     last_layer: int
     last_expert: int
+    predict_hits: int = 0
+    predict_misses: int = 0
+    predict_enqueues: int = 0
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.predict_hits + self.predict_misses
+        return 0.0 if total == 0 else self.predict_hits / total
+
+
+def query_green_context_compute_sms(device_ordinal: int, worker_sm_count: int) -> tuple[int, int]:
+    """Query CUDA driver SM green-context split so preparation compiles compute kernels for exact compute SMs."""
+    if type(worker_sm_count) is not int or worker_sm_count <= 0:
+        raise ValueError("worker_sm_count must be a positive integer")
+    torch.cuda.init()
+    lib = C.CDLL("libcuda.so.1")
+
+    class _DevResource(C.Structure):
+        _fields_ = [
+            ("type", C.c_int),
+            ("_internal_padding", C.c_ubyte * 92),
+            ("sm_count", C.c_uint32),
+            ("min_sm_partition_size", C.c_uint32),
+            ("sm_coscheduled_alignment", C.c_uint32),
+            ("flags", C.c_uint32),
+            ("_tail", C.c_ubyte * 32),
+        ]
+
+    def call(name, *args):
+        fn = getattr(lib, name)
+        fn.restype = C.c_int
+        rc = fn(*args)
+        if rc != 0:
+            msg = C.c_char_p()
+            lib.cuGetErrorString(C.c_int(rc), C.byref(msg))
+            raise RuntimeError(f"{name} failed with CUDA {rc}: {msg.value!r}")
+
+    sm_res = _DevResource()
+    w_res = _DevResource()
+    c_res = _DevResource()
+    nb = C.c_uint(1)
+    call("cuDeviceGetDevResource", C.c_int(device_ordinal), C.byref(sm_res), C.c_int(1))
+    call(
+        "cuDevSmResourceSplitByCount",
+        C.byref(w_res), C.byref(nb), C.byref(sm_res), C.byref(c_res),
+        C.c_uint(0), C.c_uint(worker_sm_count),
+    )
+    w_sms, c_sms = int(w_res.sm_count), int(c_res.sm_count)
+    if w_sms == 0 or c_sms == 0:
+        raise ValueError(f"invalid green context SM split for worker_sm_count={worker_sm_count}: ({w_sms}, {c_sms})")
+    return w_sms, c_sms
 
 
 class SM103ExpertMoverRuntime:
-    """Own GPU descriptor tables, lock-free prefetch ring, and mapped-host controls.
+    """Own GPU descriptor tables, lock-free prefetch ring, predictor state, and mapped-host controls.
 
     Prepares the persistent 1D-TMA mover kernel for capture as a dedicated
     ``Execution.persistent_worker`` graph running on a spatially partitioned
     CUDA green context alongside compute graphs.
     """
 
-    METRICS_COUNT = 5
+    METRICS_COUNT = 8
     CONTROL_BYTES = 128
 
     def __init__(
@@ -74,10 +169,13 @@ class SM103ExpertMoverRuntime:
         desc_bytes = self.binding.layer_desc_bytes()
         hdr_bytes = self.binding.queue_header_bytes()
         req_bytes = self.binding.queue_request_bytes()
-        if desc_bytes != 192 or hdr_bytes != 64 or req_bytes != 16:
-            raise RuntimeError(f"unexpected mover struct sizes: desc={desc_bytes}, hdr={hdr_bytes}, req={req_bytes}")
+        pred_bytes = self.binding.predictor_state_bytes()
+        if desc_bytes != 192 or hdr_bytes != 128 or req_bytes != 16 or pred_bytes != 64:
+            raise RuntimeError(
+                f"unexpected mover struct sizes: desc={desc_bytes}, hdr={hdr_bytes}, req={req_bytes}, pred={pred_bytes}"
+            )
 
-        # MappedHost control block: [0..4) stop_flag (uint32), [8..8+5*8) metrics (uint64[5]).
+        # MappedHost control block: [0..4) stop_flag (uint32), [8..8+8*8) metrics (uint64[8]).
         self.control_region = storage.host_allocate(control_buffer_name, (self.CONTROL_BYTES,), torch.uint8)
         self.control_region.host_view.zero_()
         self.stop_flag_ptr = int(self.control_region.device_view.data_ptr())
@@ -119,8 +217,59 @@ class SM103ExpertMoverRuntime:
         struct.pack_into("<III", header_init, 0, 0, 0, queue_capacity - 1)
         self.queue_header = persistent_copy(torch.tensor(list(header_init), dtype=torch.uint8, device=self.device))
         self.queue_ring = persistent_zeros((queue_capacity * req_bytes,), dtype=torch.uint8, device=self.device)
+        self.predictor_bindings: list[PredictorLayerBinding] = []
         for tensor in (self.layer_descs, self.queue_header, self.queue_ring, self.control_region.device_view):
             record_numeric_tensor(tensor)
+
+    def attach_predictors(self, config: PredictorConfig | None = None) -> tuple[PredictorLayerBinding, ...]:
+        """Allocate per-layer GPU predictor tables and bind them to each MegaMoeDynamicHostTier."""
+        if self.predictor_bindings:
+            raise RuntimeError("predictors have already been attached to this mover runtime")
+        cfg = PredictorConfig() if config is None else config
+        pred_bytes = self.binding.predictor_state_bytes()
+        bindings = []
+        init_clock = max(1, cfg.cooldown_steps)
+        for layer_idx, (tier, _) in enumerate(self.layers):
+            if tier.rows > 256:
+                raise ValueError(f"inline GPU predictor supports up to 256 experts, got {tier.rows}")
+            scores = persistent_zeros((tier.rows,), dtype=torch.int32, device=self.device)
+            last_seen = persistent_zeros((tier.rows,), dtype=torch.int32, device=self.device)
+            cooldown = persistent_zeros((tier.rows,), dtype=torch.int32, device=self.device)
+            raw = struct.pack(
+                "<3Q8I",
+                int(scores.data_ptr()),
+                int(last_seen.data_ptr()),
+                int(cooldown.data_ptr()),
+                init_clock,
+                layer_idx,
+                cfg.decay_shift,
+                cfg.promote_threshold,
+                cfg.hysteresis,
+                cfg.cooldown_steps,
+                cfg.max_enqueues,
+                cfg.max_predict_rows,
+            )
+            assert len(raw) == 56, len(raw)
+            state = persistent_copy(
+                torch.tensor(list(raw) + [0] * (pred_bytes - len(raw)), dtype=torch.uint8, device=self.device)
+            )
+            for tensor in (scores, last_seen, cooldown, state):
+                record_numeric_tensor(tensor)
+            binding = PredictorLayerBinding(
+                layer_idx=layer_idx,
+                state=state,
+                scores=scores,
+                last_seen=last_seen,
+                cooldown=cooldown,
+                queue_header=self.queue_header,
+                queue_ring=self.queue_ring,
+                metrics_ptr=self.metrics_ptr,
+                metrics_count=self.METRICS_COUNT,
+            )
+            tier.predictor_binding = binding
+            bindings.append(binding)
+        self.predictor_bindings = bindings
+        return tuple(bindings)
 
     def enqueue_swap(self, layer_idx: int, expert_in: int, victim_expert: int = -1) -> None:
         self.binding.launch_enqueue_swap(
@@ -171,7 +320,7 @@ class SM103ExpertMoverRuntime:
 
     def read_metrics(self) -> MoverMetrics:
         raw = bytes(self.control_region.host_view[8:8 + self.METRICS_COUNT * 8].tolist())
-        swaps, copied, rcu_waits, skipped, last_packed = struct.unpack("<5Q", raw)
+        swaps, copied, rcu_waits, skipped, last_packed, p_hits, p_misses, p_enq = struct.unpack("<8Q", raw)
         return MoverMetrics(
             swaps_completed=swaps,
             bytes_copied=copied,
@@ -179,13 +328,39 @@ class SM103ExpertMoverRuntime:
             skipped_already_resident=skipped,
             last_layer=(last_packed >> 32) & 0xFFFFFFFF,
             last_expert=last_packed & 0xFFFFFFFF,
+            predict_hits=p_hits,
+            predict_misses=p_misses,
+            predict_enqueues=p_enq,
         )
 
+    def reset_metrics(self) -> None:
+        self.control_region.host_view[8:8 + self.METRICS_COUNT * 8].zero_()
+
+    def reset_runtime_state(self) -> None:
+        """Reset mutable queue, epoch, predictor, and metric state after preparation warmup."""
+        header_init = bytearray(self.binding.queue_header_bytes())
+        struct.pack_into("<III", header_init, 0, 0, 0, self.queue_capacity - 1)
+        self.queue_header.copy_(torch.tensor(list(header_init), dtype=torch.uint8, device=self.device))
+        self.queue_ring.zero_()
+        self.control_region.host_view.zero_()
+        for tier, _ in self.layers:
+            tier.layer_epoch.zero_()
+        for binding in self.predictor_bindings:
+            binding.scores.zero_()
+            binding.last_seen.zero_()
+            binding.cooldown.zero_()
+            # Restore step_clock = max(1, cooldown_steps) at offset 24 (after 3 x uint64 pointers).
+            cooldown_steps = struct.unpack_from("<I", bytes(binding.state[44:48].cpu().tolist()), 0)[0]
+            init_clock = max(1, cooldown_steps)
+            binding.state[24:28].copy_(
+                torch.tensor(list(struct.pack("<I", init_clock)), dtype=torch.uint8, device=self.device)
+            )
+
     def reset_stop_flag(self) -> None:
-        self.control_region.host_view[:4].view(torch.int32)[0] = 0
+        self.binding.store_stop_flag_release(self.stop_flag_ptr, 0)
 
     def signal_stop(self) -> None:
-        self.control_region.host_view[:4].view(torch.int32)[0] = 1
+        self.binding.store_stop_flag_release(self.stop_flag_ptr, 1)
 
     def close(self) -> None:
         if not self.control_region.closed:
