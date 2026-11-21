@@ -132,3 +132,83 @@ class MegaMoeHostTier:
                 raise ValueError("MegaMoE host weight copy requires the prepared physical layout")
         for src, dst in zip(source, self.host_views):
             dst[start:start + count].copy_(src)
+
+
+class MegaMoeDynamicHostTier:
+    """Canonical HOST_NUMA backing for all E experts plus dynamic HBM slot-map indirection.
+
+    Every canonical expert ``0..E-1`` lives permanently at its canonical row in mapped host
+    memory. HBM holds ``hbm_slots = active_slots + spare_slots`` (with ``spare_slots >= 1``)
+    so a concurrent GPU mover can copy a cold expert into an unmapped spare slot, publish the
+    swap into ``live_slot_map``, and wait out the Dekker/epoch-RCU grace period via
+    ``layer_epoch`` before reclaiming the evicted slot.
+    """
+
+    MAGIC_INDIR = 0x49505244  # "DRPI"
+
+    def __init__(self, geometry, *, hbm_slots, initial_hbm_experts, storage, name):
+        device = torch.device("cuda", storage.device)
+        initial_hbm_experts = tuple(initial_hbm_experts)
+        if (type(hbm_slots) is not int or not 2 <= hbm_slots <= geometry.experts):
+            raise ValueError("dynamic MegaMoE tier requires hbm_slots in [2, experts]")
+        if (not initial_hbm_experts or len(initial_hbm_experts) >= hbm_slots
+                or len(set(initial_hbm_experts)) != len(initial_hbm_experts)
+                or any(type(e) is not int or not 0 <= e < geometry.experts for e in initial_hbm_experts)):
+            raise ValueError("dynamic MegaMoE tier requires unique initial HBM experts leaving at least one spare slot")
+        properties = torch.cuda.get_device_properties(device)
+        if (properties.major, properties.minor) != (10, 3):
+            raise ValueError("the dynamic MegaMoE Grace tier requires SM103")
+        self.geometry = geometry
+        self.rows = geometry.experts
+        self.hbm_slots = hbm_slots
+        self.host_lane_clusters = 0
+        self.indirection = True
+        self.regions, self.host_views, self.device_views = [], [], []
+        self.plane_row_bytes = []
+        labels = ("gate_up", "gate_up_scales", "down", "down_scales")
+        layouts = mxfp4_weight_layouts(geometry.experts, geometry.hidden, geometry.intermediate)
+        for label, (shape, dtype, stride) in zip(labels, layouts):
+            region = storage.host_allocate(f"{name}.{label}", (math.prod(shape),), dtype)
+            self.regions.append(region)
+            self.host_views.append(region.host_view.as_strided(shape, stride))
+            self.device_views.append(region.device_view.as_strided(shape, stride))
+            row_bytes = stride[0] * dtype.itemsize
+            if row_bytes % 16 != 0:
+                raise ValueError(f"dynamic MegaMoE plane {label} row size {row_bytes} must be 16-byte aligned for 1D TMA")
+            self.plane_row_bytes.append(row_bytes)
+        self.weights = MegaMoeWeights(tuple(self.device_views[:2]), tuple(self.device_views[2:]))
+        self.cpu_weights = MegaMoeWeights(tuple(self.host_views[:2]), tuple(self.host_views[2:]))
+        for value in self.device_views:
+            record_numeric_tensor(value)
+
+        slot_map = [-1] * geometry.experts
+        slot_owner = [-1] * hbm_slots
+        for slot, expert in enumerate(initial_hbm_experts):
+            slot_map[expert] = slot
+            slot_owner[slot] = expert
+        self.live_slot_map = persistent_copy(torch.tensor(slot_map, dtype=torch.int32, device=device))
+        self.slot_owner = persistent_copy(torch.tensor(slot_owner, dtype=torch.int32, device=device))
+        self.layer_epoch = persistent_zeros((1,), dtype=torch.int32, device=device)
+        self.descriptors = persistent_zeros((160 * 4 * 128,), dtype=torch.uint8, device=device)
+        header = torch.zeros(16 + geometry.experts, dtype=torch.int32)
+        header[0] = self.MAGIC_INDIR
+        header[1] = hbm_slots
+        header[:16].view(torch.int64)[1:5] = torch.tensor([t.data_ptr() for t in self.device_views], dtype=torch.int64)
+        header[:16].view(torch.int64)[6] = self.layer_epoch.data_ptr()
+        header[:16].view(torch.int64)[7] = self.descriptors.data_ptr()
+        header[16:] = torch.tensor(slot_map, dtype=torch.int32)
+        self.control = persistent_copy(header.to(device))
+        for t in (self.live_slot_map, self.slot_owner, self.layer_epoch, self.descriptors, self.control):
+            record_numeric_tensor(t)
+
+    def copy_weights(self, weights, *, start=0):
+        """Fill canonical host rows during loading from a bounded batch of transformed experts."""
+        source = (*weights.gate_up, *weights.down)
+        count = source[0].shape[0]
+        if type(start) is not int or count <= 0 or start < 0 or start + count > self.rows:
+            raise ValueError("MegaMoE host weight copy exceeds the allocated expert rows")
+        for src, dst in zip(source, self.host_views):
+            if src.shape != (count, *dst.shape[1:]) or src.dtype != dst.dtype or src.stride() != dst.stride():
+                raise ValueError("MegaMoE host weight copy requires the prepared physical layout")
+        for src, dst in zip(source, self.host_views):
+            dst[start:start + count].copy_(src)

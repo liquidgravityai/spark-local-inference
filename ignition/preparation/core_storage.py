@@ -357,7 +357,11 @@ class CoreStorage:
         if self._host_cursor + region.extent > self.HOST_BASE + self.HOST_RESERVATION_BYTES:
             region.close()
             raise MemoryError("native core host-address range exhausted")
-        self._host_cursor += region.extent
+        # Align Linux host regions onto disjoint 64 MiB VA windows so Helios can
+        # back each MappedHost allocation with fixed-address HOST_NUMA VMM chunks
+        # without adjacent allocations sharing a Linux UVM virtual chunk.
+        stride = (-(-region.extent // (64 << 20)) * (64 << 20)) if os.name != "nt" else region.extent
+        self._host_cursor += stride
         self.host_regions.append(region)
         return region
 

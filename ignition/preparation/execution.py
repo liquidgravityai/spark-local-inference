@@ -132,6 +132,41 @@ class TuningGraph:
             raise ValueError("tuning status must be separate from selected outputs")
 
 
+@dataclass(frozen=True)
+class PersistentWorker:
+    """Dedicated background worker graph launched once on a partitioned CUDA green context."""
+
+    name: str
+    graph: Any
+    worker_sm_count: int
+    stop_flag_buffer: str
+    stop_flag_offset: int = 0
+    metrics_buffer: str = ""
+    metrics_offset: int = 0
+    metrics_count: int = 0
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("persistent worker requires a nonempty graph name")
+        if type(self.worker_sm_count) is not int or not 0 < self.worker_sm_count < (1 << 32):
+            raise ValueError("persistent worker requires a positive uint32 worker_sm_count")
+        if not isinstance(self.stop_flag_buffer, str) or not self.stop_flag_buffer.strip():
+            raise ValueError("persistent worker requires a stop_flag_buffer name")
+        if type(self.stop_flag_offset) is not int or self.stop_flag_offset < 0 or self.stop_flag_offset % 4:
+            raise ValueError("persistent worker stop_flag_offset must be a nonnegative 4-byte-aligned integer")
+        if type(self.metrics_count) is not int or not 0 <= self.metrics_count < (1 << 32):
+            raise ValueError("persistent worker metrics_count must be a uint32")
+        if type(self.metrics_offset) is not int or self.metrics_offset < 0:
+            raise ValueError("persistent worker metrics_offset must be a nonnegative integer")
+        if self.metrics_count > 0:
+            if not isinstance(self.metrics_buffer, str) or not self.metrics_buffer.strip():
+                raise ValueError("persistent worker metrics_buffer is required when metrics_count > 0")
+            if self.metrics_offset % 8:
+                raise ValueError("persistent worker metrics_offset must be 8-byte aligned")
+        elif self.metrics_buffer != "" or self.metrics_offset != 0:
+            raise ValueError("persistent worker metrics_buffer and metrics_offset must be empty/zero when metrics_count == 0")
+
+
 class PreparedExecution(PreparedGraphBundle):
     """Retain immutable graph ownership and export the matching native ABI.
 
@@ -143,16 +178,27 @@ class PreparedExecution(PreparedGraphBundle):
 
     def __init__(self, *, signatures: Mapping[str, GraphSignature], max_active: int = 4,
                  estimated_durations_ns=None, export_zero_ranges=(), export_events=None,
-                 tuning_graphs=None, tuned_bindings=None, **kwargs):
+                 tuning_graphs=None, tuned_bindings=None, persistent_worker=None, **kwargs):
         serving = dict(kwargs.pop("graphs"))
         tuners = dict(tuning_graphs or {})
         if set(serving).intersection(tuners):
             raise ValueError("serving and tuning graph names must be distinct")
         if any(not isinstance(value, TuningGraph) for value in tuners.values()):
             raise TypeError("startup tuning entries must be TuningGraph objects")
-        super().__init__(graphs={**serving, **{name: value.graph for name, value in tuners.items()}}, **kwargs)
+        worker_graphs = {}
+        if persistent_worker is not None:
+            if not isinstance(persistent_worker, PersistentWorker):
+                raise TypeError("persistent_worker must be a PersistentWorker object")
+            if persistent_worker.name in serving or persistent_worker.name in tuners:
+                raise ValueError("persistent worker graph name must be distinct from serving and tuning graphs")
+            worker_graphs[persistent_worker.name] = persistent_worker.graph
+        super().__init__(
+            graphs={**serving, **{name: value.graph for name, value in tuners.items()}, **worker_graphs},
+            **kwargs,
+        )
         self.serving_graphs = MappingProxyType(serving)
         self.tuning_graphs = MappingProxyType(tuners)
+        self.persistent_worker = persistent_worker
         bindings = {name: tuple(values) for name, values in (tuned_bindings or {}).items()}
         if not bindings.keys() <= serving.keys():
             raise ValueError("tuned bindings must name serving graphs")
@@ -192,6 +238,30 @@ class PreparedExecution(PreparedGraphBundle):
             for value in values:
                 if value.tuning_graph not in tuners or value.buffer not in tuners[value.tuning_graph].outputs:
                     raise ValueError("tuned binding must name an output of its tuning graph")
+        if self.persistent_worker is not None:
+            pw = self.persistent_worker
+            if pw.stop_flag_buffer not in self.buffers:
+                raise ValueError("persistent worker stop_flag_buffer must be a registered execution buffer")
+            if pw.stop_flag_buffer in uploads:
+                raise ValueError("persistent worker stop_flag_buffer cannot receive host uploads")
+            stop_tensor = self.buffers[pw.stop_flag_buffer]
+            stop_nbytes = stop_tensor.numel() * stop_tensor.element_size()
+            if pw.stop_flag_offset + 4 > stop_nbytes:
+                raise ValueError("persistent worker stop flag exceeds its registered buffer")
+            if pw.metrics_count > 0:
+                if pw.metrics_buffer not in self.buffers:
+                    raise ValueError("persistent worker metrics_buffer must be a registered execution buffer")
+                if pw.metrics_buffer in uploads:
+                    raise ValueError("persistent worker metrics_buffer cannot receive host uploads")
+                metrics_tensor = self.buffers[pw.metrics_buffer]
+                metrics_nbytes = metrics_tensor.numel() * metrics_tensor.element_size()
+                metrics_end = pw.metrics_offset + pw.metrics_count * 8
+                if metrics_end > metrics_nbytes:
+                    raise ValueError("persistent worker metrics range exceeds its registered buffer")
+                if (pw.metrics_buffer == pw.stop_flag_buffer
+                        and pw.stop_flag_offset < metrics_end
+                        and pw.metrics_offset < pw.stop_flag_offset + 4):
+                    raise ValueError("persistent worker metrics range overlaps stop flag")
         self.signatures = MappingProxyType(dict(signatures))
         durations = dict.fromkeys(self.serving_graphs, 0) if estimated_durations_ns is None else dict(estimated_durations_ns)
         if durations.keys() != self.serving_graphs.keys() or any(
@@ -260,12 +330,27 @@ class PreparedExecution(PreparedGraphBundle):
                 graphs[-1].update(draft_tokens=signature.draft_tokens,
                                   verify_tokens=signature.token_capacity, draft_source=1)
         abi_version = 6
-        return {"abi_version": abi_version, "completion_token_capacity": self.completion_token_capacity,
+        result = {"abi_version": abi_version, "completion_token_capacity": self.completion_token_capacity,
                 "context": context, "device": self.device,
                 "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,
                 "buffers": descriptors, "graphs": graphs,
                 "tuning_graphs": [dict(name=name, **({} if export_graphs else {"handle": graph_handles[name]}), outputs=list(value.outputs),
                                        status_buffer=value.status_buffer) for name, value in self.tuning_graphs.items()]}
+        if self.persistent_worker is not None:
+            pw = self.persistent_worker
+            worker_dict = {
+                "worker_sm_count": pw.worker_sm_count,
+                "graph": pw.name,
+                "stop_flag_buffer": pw.stop_flag_buffer,
+                "stop_flag_offset": pw.stop_flag_offset,
+                "metrics_buffer": pw.metrics_buffer,
+                "metrics_offset": pw.metrics_offset,
+                "metrics_count": pw.metrics_count,
+            }
+            if not export_graphs:
+                worker_dict["handle"] = graph_handles[pw.name]
+            result["persistent_worker"] = worker_dict
+        return result
 
     def start_executor(self, *, peers=None):
         """Synchronize preparation and consume the bundle into the native executor."""

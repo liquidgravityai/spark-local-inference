@@ -201,7 +201,8 @@ __device__ __align__(128) cute::TmaDescriptor desc[kMaxSMs * 2 * kMaxVariants];
 
 namespace derpseek_host {
 constexpr uint32_t kMaxSMs = 160;
-constexpr int kMagic = 0x53505244;  // "DRPS"
+constexpr int kMagic = 0x53505244;       // "DRPS" (static host-first rows)
+constexpr int kMagicIndir = 0x49505244;  // "DRPI" (dynamic slot-map indirection + epoch RCU)
 __device__ __align__(128) cute::TmaDescriptor desc[kMaxSMs * 4];
 }  // namespace derpseek_host
 
@@ -305,12 +306,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_shared_l2_weights_sf);
     }
 
-    // Derpseek exact Grace tier: the control block (see derpseek_host). With it, the per-row token counts go to words
-    // 16.. of the same block (the residency manager reads them to promote host rows into HBM cache rows)
-    const bool drp_host = cumulative_local_expert_recv_stats != nullptr and
-                          __ldg(cumulative_local_expert_recv_stats) == derpseek_host::kMagic;
-    const uint32_t drp_num_host = drp_host ? static_cast<uint32_t>(__ldg(cumulative_local_expert_recv_stats + 1)) : 0u;
-    int* const drp_recv_stats = drp_host ? cumulative_local_expert_recv_stats + 16 : cumulative_local_expert_recv_stats;
+    // Derpseek exact Grace tier: the control block (see derpseek_host). With static kMagic, per-row token counts go to
+    // words 16..; with dynamic kMagicIndir, words 16.. hold the read-only snapshotted active_slot_map[0..kNumExperts-1]
+    // (< 0 reads canonical HOST_NUMA row, >= 0 reads HBM pool slot) and uint64[6] holds the layer_epoch pointer.
+    const int drp_magic = cumulative_local_expert_recv_stats != nullptr ? __ldg(cumulative_local_expert_recv_stats) : 0;
+    const bool drp_indir = drp_magic == derpseek_host::kMagicIndir;
+    const bool drp_host = drp_magic == derpseek_host::kMagic or drp_indir;
+    const uint32_t drp_num_host = (drp_magic == derpseek_host::kMagic) ? static_cast<uint32_t>(__ldg(cumulative_local_expert_recv_stats + 1)) : 0u;
+    int* const drp_recv_stats = drp_indir ? nullptr : (drp_host ? cumulative_local_expert_recv_stats + 16 : cumulative_local_expert_recv_stats);
 
     // Workspaces and Buffer
     const auto buffer = layout::MegaMoEBuffer(
@@ -551,7 +554,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     if (r1_flag)  // dsv41 R1: the scheduler's early-shared-weights wait spins on the router's flag too
         scheduler.use_r1(&w6c11->ready, &w6c11->r1_fallbacks);
     // Derpseek host lane: control word 10 = lane clusters (the last ones; 0 = off), words 12-13 = host claim counters
-    if (drp_host) {
+    if (drp_host and not drp_indir) {
         const uint32_t drp_lane = cute::min(static_cast<uint32_t>(__ldg(cumulative_local_expert_recv_stats + 10)), kNumSMs / 2 - 1);
         if (drp_lane != 0)
             scheduler.use_host_lane(drp_num_host, reinterpret_cast<uint32_t*>(cumulative_local_expert_recv_stats + 12),
@@ -963,7 +966,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *workspace.get_l2_task_count_ptr() = 0;
                 *workspace.get_shared_l1_task_count_ptr() = 0;
                 *workspace.get_shared_l2_task_count_ptr() = 0;
-                if (drp_host) {   // Derpseek host lane claim counters
+                if (drp_host and not drp_indir) {   // Derpseek host lane claim counters
                     cumulative_local_expert_recv_stats[12] = 0;
                     cumulative_local_expert_recv_stats[13] = 0;
                 }
@@ -1187,9 +1190,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         while (scheduler.get_next_task(task_info)) {
             if (allt_head and not task_info.is_shared())
                 task_info.valid_m = num_tokens;
-            const bool drp_row = drp_host and not task_info.is_shared() and task_info.local_expert_idx < drp_num_host;
-            const uint32_t drp_expert_idx = (drp_host and not task_info.is_shared() and not drp_row) ?
-                                            task_info.local_expert_idx - drp_num_host : task_info.local_expert_idx;
+            bool drp_row = false;
+            uint32_t drp_expert_idx = task_info.local_expert_idx;
+            if (drp_host and not task_info.is_shared()) {
+                if (drp_indir) {
+                    int32_t mapped_slot = -1;
+                    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];"
+                                 : "=r"(mapped_slot)
+                                 : "l"(cumulative_local_expert_recv_stats + 16 + task_info.local_expert_idx)
+                                 : "memory");
+                    drp_row = mapped_slot < 0;
+                    drp_expert_idx = drp_row ? task_info.local_expert_idx : static_cast<uint32_t>(mapped_slot);
+                } else {
+                    drp_row = task_info.local_expert_idx < drp_num_host;
+                    drp_expert_idx = drp_row ? task_info.local_expert_idx : (task_info.local_expert_idx - drp_num_host);
+                }
+            }
             const cute::TmaDescriptor* tensor_map_b_ptr = drp_row ? (task_info.block_phase == sched::BlockPhase::Linear1 ? drp_desc : drp_desc + 2) :
                                           task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_weights :
                                           task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_weights :
@@ -1885,6 +1901,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // W6 v11: self-clear skip_combine (every CTA read it before the grid sync) and export the slot layout
         if (sm_idx == 0 and epilogue_thread_idx == 0) {
+            // Dynamic indirection RCU exit: all CTAs have completed weight reads before the grid sync above.
+            if (drp_indir) {
+                const uint64_t epoch_addr = reinterpret_cast<const uint64_t*>(cumulative_local_expert_recv_stats)[6];
+                if (epoch_addr != 0ull) {
+                    uint32_t old_ep;
+                    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"
+                                 : "=r"(old_ep) : "l"(epoch_addr) : "memory");
+                }
+            }
             // dsv41 R1: every CTA passed its wait before the grid sync: re-arm the flag for the next call, and wait
             // for the router grid's completion here (long done) so this grid still completes after its producer
             if (r1_flag) {

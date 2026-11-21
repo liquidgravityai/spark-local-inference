@@ -207,6 +207,86 @@ pub(crate) fn execution(
                 .ok_or_else(|| super::invalid("invalid tuning graph"))?.remove("handle");
         }
     }
+    if let Some(worker) = object.get("persistent_worker").cloned() {
+        if !worker.is_null() {
+            let mut worker_obj = worker
+                .as_object()
+                .ok_or_else(|| super::invalid("persistent_worker must be an object"))?
+                .clone();
+            worker_obj.remove("handle");
+            let resolve_mapped_host = |buf_name: &str, offset: u64, nbytes: u64| -> super::Result<(String, u64)> {
+                let buffers = object
+                    .get("buffers")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| super::invalid("execution buffers must be an array"))?;
+                if let Some(buf) = buffers.iter().find(|b| b.get("name").and_then(|n| n.as_str()) == Some(buf_name)) {
+                    let buf_nbytes = buf.get("nbytes").and_then(|v| v.as_u64())
+                        .ok_or_else(|| super::invalid("persistent worker buffer lacks nbytes"))?;
+                    let end = offset.checked_add(nbytes)
+                        .ok_or_else(|| super::invalid("persistent worker buffer offset overflow"))?;
+                    if end > buf_nbytes {
+                        return Err(super::invalid("persistent worker range exceeds registered buffer"));
+                    }
+                    let reference = buf.get("reference").and_then(|v| v.as_object())
+                        .ok_or_else(|| super::invalid("persistent worker buffer lacks allocation reference"))?;
+                    let alloc_name = reference.get("allocation").and_then(|v| v.as_str())
+                        .ok_or_else(|| super::invalid("persistent worker reference lacks allocation name"))?;
+                    let alloc_offset = reference.get("offset").and_then(|v| v.as_u64())
+                        .ok_or_else(|| super::invalid("persistent worker reference lacks offset"))?;
+                    let alloc = allocations.iter().find(|a| a.name == alloc_name)
+                        .ok_or_else(|| super::invalid("persistent worker allocation not found"))?;
+                    if alloc.memory != "mapped_host" {
+                        return Err(super::invalid("persistent worker control buffers must reside in mapped_host allocations"));
+                    }
+                    let final_offset = alloc_offset.checked_add(offset)
+                        .ok_or_else(|| super::invalid("persistent worker allocation offset overflow"))?;
+                    return Ok((alloc_name.to_owned(), final_offset));
+                }
+                if let Some(alloc) = allocations.iter().find(|a| a.name == buf_name) {
+                    if alloc.memory != "mapped_host" {
+                        return Err(super::invalid("persistent worker control buffers must reside in mapped_host allocations"));
+                    }
+                    let end = offset.checked_add(nbytes)
+                        .ok_or_else(|| super::invalid("persistent worker allocation offset overflow"))?;
+                    if end > alloc.nbytes {
+                        return Err(super::invalid("persistent worker range exceeds mapped_host allocation"));
+                    }
+                    return Ok((buf_name.to_owned(), offset));
+                }
+                Err(super::invalid("persistent worker references unknown control buffer"))
+            };
+            let stop_buf = worker_obj.get("stop_flag_buffer").and_then(|v| v.as_str())
+                .ok_or_else(|| super::invalid("persistent_worker requires stop_flag_buffer"))?.to_owned();
+            let stop_off = worker_obj.get("stop_flag_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+            let (stop_alloc, stop_final_off) = resolve_mapped_host(&stop_buf, stop_off, 4)?;
+            if stop_final_off % 4 != 0 {
+                return Err(super::invalid("persistent worker stop flag offset must be 4-byte aligned"));
+            }
+            worker_obj.insert("stop_flag_buffer".into(), stop_alloc.clone().into());
+            worker_obj.insert("stop_flag_offset".into(), stop_final_off.into());
+            let metrics_count = worker_obj.get("metrics_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            if metrics_count > 0 {
+                let metrics_buf = worker_obj.get("metrics_buffer").and_then(|v| v.as_str())
+                    .ok_or_else(|| super::invalid("persistent_worker requires metrics_buffer when metrics_count > 0"))?.to_owned();
+                let metrics_off = worker_obj.get("metrics_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                let metrics_bytes = metrics_count.checked_mul(8)
+                    .ok_or_else(|| super::invalid("persistent worker metrics extent overflow"))?;
+                let (metrics_alloc, metrics_final_off) = resolve_mapped_host(&metrics_buf, metrics_off, metrics_bytes)?;
+                if metrics_final_off % 8 != 0 {
+                    return Err(super::invalid("persistent worker metrics offset must be 8-byte aligned"));
+                }
+                if metrics_alloc == stop_alloc
+                    && stop_final_off < metrics_final_off + metrics_bytes
+                    && metrics_final_off < stop_final_off + 4
+                {
+                    return Err(super::invalid("persistent worker metrics range overlaps stop flag"));
+                }
+                worker_obj.insert("metrics_buffer".into(), metrics_alloc.into());
+                worker_obj.insert("metrics_offset".into(), metrics_final_off.into());
+            }
+            object.insert("persistent_worker".into(), serde_json::Value::Object(worker_obj));
+        }
+    }
     message("Execution", &value)
 }
 
@@ -867,6 +947,66 @@ mod tests {
         assert_eq!(encoded.tuning_graphs[0].status_buffer, "status");
         assert_eq!(encoded.graphs[0].tuned_bindings[0].tuning_graph, "tune");
         assert_eq!(encoded.graphs[0].tuned_bindings[0].buffer, "winner");
+    }
+
+    #[test]
+    fn persistent_worker_export_resolves_mapped_host_buffers_and_rejects_invalid() {
+        let host_alloc = super::super::Allocation {
+            name: "host-0".into(),
+            address: 0x0c00_0000_0000,
+            nbytes: 4096,
+            alignment: 4096,
+            initialize: "snapshot".into(),
+            relocations: vec![],
+            preserve_address: true,
+            memory: "mapped_host".into(),
+            snapshot_spans: None,
+            sizing: None,
+        };
+        let dev_alloc = super::super::Allocation {
+            name: "device-0".into(),
+            address: 0x0800_0000_0000,
+            nbytes: 4096,
+            alignment: 4096,
+            initialize: "snapshot".into(),
+            relocations: vec![],
+            preserve_address: true,
+            memory: "device".into(),
+            snapshot_spans: None,
+            sizing: None,
+        };
+        let value = serde_json::json!({
+            "abi_version": 6, "max_active": 1, "input_frame_bytes": 8,
+            "buffers": [
+                {"name": "worker_ctrl", "address": 0x0c00_0000_0040u64, "nbytes": 128,
+                 "dtype": "uint8", "shape": [128], "strides": [1]},
+                {"name": "dev_buf", "address": 0x0800_0000_0000u64, "nbytes": 64,
+                 "dtype": "uint8", "shape": [64], "strides": [1]}
+            ],
+            "graphs": [],
+            "persistent_worker": {
+                "worker_sm_count": 8, "graph": "mover", "handle": 99,
+                "stop_flag_buffer": "worker_ctrl", "stop_flag_offset": 0,
+                "metrics_buffer": "worker_ctrl", "metrics_offset": 8, "metrics_count": 5
+            }
+        });
+        let encoded = execution(&value, &[host_alloc.clone(), dev_alloc.clone()]).unwrap();
+        let pw = encoded.persistent_worker.expect("persistent_worker present");
+        assert_eq!(pw.worker_sm_count, 8);
+        assert_eq!(pw.graph, "mover");
+        assert_eq!(pw.stop_flag_buffer, "host-0");
+        assert_eq!(pw.stop_flag_offset, 0x40);
+        assert_eq!(pw.metrics_buffer, "host-0");
+        assert_eq!(pw.metrics_offset, 0x48);
+        assert_eq!(pw.metrics_count, 5);
+
+        let mut bad_mem = value.clone();
+        bad_mem["persistent_worker"]["stop_flag_buffer"] = serde_json::json!("dev_buf");
+        assert!(execution(&bad_mem, &[host_alloc.clone(), dev_alloc.clone()]).is_err());
+
+        let mut bad_overlap = value.clone();
+        bad_overlap["persistent_worker"]["metrics_offset"] = serde_json::json!(0);
+        assert!(execution(&bad_overlap, &[host_alloc, dev_alloc]).is_err());
     }
 
     fn rebuild_catalog() -> (super::super::wire::RebuildWeights, Vec<super::super::wire::Allocation>) {

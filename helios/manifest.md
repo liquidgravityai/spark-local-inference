@@ -87,7 +87,7 @@ producers. Tuning storage remains owned through execution drain.
 ## Persistent worker graphs
 
 An execution catalog may optionally declare `Execution.persistent_worker`
-(Protobuf message `PersistentWorker`, field 8) to run a single dedicated graph
+(Protobuf message `PersistentWorker`, field 9) to run a single dedicated graph
 concurrently with serving graphs on a spatially partitioned CUDA Green Context.
 The declaration carries:
 
