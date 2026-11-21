@@ -735,7 +735,7 @@ mod tests {
             buffers: vec![BufferDescriptor {
                 name: "other".into(), shape: vec![], ..buffer.clone()
             }, buffer],
-            graphs: vec![], tuning_graphs: vec![],
+            graphs: vec![], tuning_graphs: vec![], persistent_worker: None,
         };
         view.validate(&manifest).unwrap();
         let mut missing = view.clone();

@@ -266,6 +266,7 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
         buffers,
         graphs,
         tuning_graphs,
+        persistent_worker: None,
     })
 }
 

@@ -590,6 +590,17 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
         (Some(_), None) | (None, Some(_)) => return false,
         _ => {}
     }
+    match (&a.persistent_worker, &b.persistent_worker) {
+        (Some(a), Some(b))
+            if a.worker_sm_count != b.worker_sm_count
+                || a.graph != b.graph
+                || a.metrics_count != b.metrics_count =>
+        {
+            return false;
+        }
+        (Some(_), None) | (None, Some(_)) => return false,
+        _ => {}
+    }
     a.completion_token_capacity == b.completion_token_capacity
         && a.max_active == b.max_active
         && a.input_frame_bytes == b.input_frame_bytes

@@ -191,6 +191,7 @@ impl LoadOptions {
         let widths: Vec<_> = widths.into_iter().filter(|_| enabled).collect();
         let mut rank_catalog = None;
         let mut rank_tuning_catalog = None;
+        let mut rank_worker_catalog = None;
         for (rank, core) in cores.iter_mut().enumerate() {
             let execution = core.execution.as_mut().ok_or_else(|| invalid("rank lacks serving contract"))?;
             if crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity) != completion_token_capacity {
@@ -245,6 +246,11 @@ impl LoadOptions {
             for graph in &execution.tuning_graphs {
                 if graph.name.is_empty() || !names.insert(graph.name.clone()) {
                     return Err(invalid("duplicate or unnamed startup tuning graph"));
+                }
+            }
+            if let Some(worker) = &execution.persistent_worker {
+                if worker.graph.is_empty() || !names.insert(worker.graph.clone()) {
+                    return Err(invalid("duplicate or unnamed persistent worker graph"));
                 }
             }
             let resources: HashSet<_> = core.graphs.iter().map(|g| g.name.clone()).collect();
@@ -337,8 +343,24 @@ impl LoadOptions {
                 return Err(invalid("selected graph catalogs differ between ranks"));
             }
             rank_catalog = Some(catalog);
+            let worker_catalog = execution.persistent_worker.as_ref().map(|worker| {
+                (
+                    worker.worker_sm_count,
+                    worker.graph.clone(),
+                    worker.metrics_count,
+                )
+            });
+            if rank_worker_catalog
+                .as_ref()
+                .is_some_and(|expected| *expected != worker_catalog)
+            {
+                return Err(invalid("persistent worker catalogs differ between ranks"));
+            }
+            rank_worker_catalog = Some(worker_catalog);
             let selected: HashSet<_> = execution.graphs.iter().map(|g| g.name.as_str())
-                .chain(execution.tuning_graphs.iter().map(|g| g.name.as_str())).collect();
+                .chain(execution.tuning_graphs.iter().map(|g| g.name.as_str()))
+                .chain(execution.persistent_worker.iter().map(|w| w.graph.as_str()))
+                .collect();
             core.graphs.retain(|g| selected.contains(g.name.as_str()));
             prune_kernels(core)?;
         }
@@ -547,6 +569,72 @@ mod tests {
             assert!(LoadOptions { max_concurrency: Some(1), mtp_draft_tokens: Some(0), ..Default::default() }
                 .select(&mut cores, &mut config()).is_err());
         }
+    }
+
+    #[test]
+    fn selected_graphs_retain_persistent_worker_and_require_rank_agreement() {
+        let worker_core = || {
+            let mut core = core();
+            let function = core.graphs.last().unwrap().functions[0];
+            core.graphs.push(Graph {
+                name: "worker_loop".into(),
+                flags: 0,
+                resource: "worker_loop".into(),
+                node_count: 1,
+                edge_count: 0,
+                functions: vec![function],
+            });
+            core.execution.as_mut().unwrap().persistent_worker = Some(wire::PersistentWorker {
+                worker_sm_count: 8,
+                graph: "worker_loop".into(),
+                stop_flag_buffer: "worker_ctrl".into(),
+                stop_flag_offset: 0,
+                metrics_buffer: String::new(),
+                metrics_offset: 0,
+                metrics_count: 0,
+            });
+            core
+        };
+        let mut cores = [worker_core(), worker_core()];
+        LoadOptions {
+            max_concurrency: Some(1),
+            mtp_draft_tokens: Some(0),
+            ..Default::default()
+        }
+        .select(&mut cores, &mut config())
+        .unwrap();
+        for core in &cores {
+            assert!(core.graphs.iter().any(|g| g.name == "worker_loop"));
+            assert_eq!(
+                core.execution
+                    .as_ref()
+                    .unwrap()
+                    .persistent_worker
+                    .as_ref()
+                    .unwrap()
+                    .worker_sm_count,
+                8
+            );
+        }
+        // Rank mismatch in worker_sm_count must fail selection.
+        let mut mismatched = [worker_core(), worker_core()];
+        mismatched[1]
+            .execution
+            .as_mut()
+            .unwrap()
+            .persistent_worker
+            .as_mut()
+            .unwrap()
+            .worker_sm_count = 16;
+        assert!(
+            LoadOptions {
+                max_concurrency: Some(1),
+                mtp_draft_tokens: Some(0),
+                ..Default::default()
+            }
+            .select(&mut mismatched, &mut config())
+            .is_err()
+        );
     }
 
     fn config() -> Value {

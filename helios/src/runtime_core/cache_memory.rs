@@ -818,6 +818,7 @@ impl NativeResources {
                         nbytes: allocation.nbytes,
                         memory: Memory::Device,
                         fixed: true,
+                        host_vmm: false,
                         mappings: Vec::new(),
                     },
                 );
