@@ -718,6 +718,8 @@ message Execution {
   uint32 completion_token_capacity = 7;
   // Optional storage declaration; absence retains static expert placement.
   ExpertRowCatalog expert_rows = 8;
+  // Optional dedicated worker graph launched once on a partitioned CUDA green context.
+  PersistentWorker persistent_worker = 9;
 }
 // Canonical expert identities and physical row order, authenticated with execution.
 // This describes storage, not a placement policy or a new graph operation.
@@ -739,6 +741,15 @@ message ExpertRowPlane {
   // the same per-row dtype, shape and stride; only axis-zero counts differ.
   string host_weight_view = 1;
   string hbm_weight_view = 2;
+}
+message PersistentWorker {
+  uint32 worker_sm_count = 1;
+  string graph = 2;
+  string stop_flag_buffer = 3;
+  uint64 stop_flag_offset = 4;
+  string metrics_buffer = 5;
+  uint64 metrics_offset = 6;
+  uint32 metrics_count = 7;
 }
 message TuningGraph {
   string name = 1;

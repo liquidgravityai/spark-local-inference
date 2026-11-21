@@ -232,6 +232,38 @@ fn fixed_bytes(core: &Core, integrated: bool) -> Result<u64> {
         })
 }
 
+pub(super) fn mapped_host_bytes(core: &Core) -> Result<u64> {
+    core.allocations
+        .iter()
+        .filter(|a| a.sizing.is_none() && matches!(a.memory, Memory::MappedHost))
+        .try_fold(0u64, |total, a| {
+            total
+                .checked_add(a.nbytes as u64)
+                .ok_or_else(|| invalid("mapped host memory overflows host address space"))
+        })
+}
+
+pub(super) fn available_host_memory() -> Result<u64> {
+    #[cfg(unix)]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").map_err(|e| e.to_string())?;
+        Ok(shared_available(&meminfo, usize::MAX)? as u64)
+    }
+    #[cfg(windows)]
+    {
+        commit_available()
+    }
+}
+
+pub(super) fn check_host_memory_fit(required: u64, available: u64) -> Result<()> {
+    if required > available {
+        return Err(invalid(format!(
+            "core needs {required} mapped host bytes; only {available} are free"
+        )));
+    }
+    Ok(())
+}
+
 fn limited_budget(
     memory: MemorySnapshot,
     loaded: u64,
@@ -492,7 +524,8 @@ fn capacities(
 }
 
 impl NativeModel {
-    /// Refuse an occupied limit smaller than the known fixed model storage before loading it.
+    /// Refuse an occupied limit smaller than the known fixed model storage before loading it,
+    /// and refuse mapped-host allocations that exceed available host memory.
     pub(super) unsafe fn check_memory_limit(
         &self,
         cores: &[Core],
@@ -500,6 +533,23 @@ impl NativeModel {
         initial: &[MemorySnapshot],
         embedding_host_bytes: u64,
     ) -> Result<()> {
+        let discrete_mapped_host = cores
+            .iter()
+            .zip(&self.ranks)
+            .filter(|(_, r)| !r.integrated)
+            .try_fold(0u64, |total, (core, _)| {
+                mapped_host_bytes(core).and_then(|bytes| {
+                    total
+                        .checked_add(bytes)
+                        .ok_or_else(|| invalid("mapped host memory overflows host address space"))
+                })
+            })?;
+        if discrete_mapped_host > 0 {
+            let required = discrete_mapped_host
+                .checked_add(embedding_host_bytes)
+                .ok_or_else(|| invalid("host model memory overflows host address space"))?;
+            check_host_memory_fit(required, available_host_memory()?)?;
+        }
         if !matches!(
             options.memory_limit,
             Some(MemoryLimit::Bytes(_) | MemoryLimit::Fraction(_))
@@ -1560,6 +1610,82 @@ mod tests {
         }
         assert!(capacities(&cores, &[1 << 30, 1 << 20], 4, 6, 64, limit).is_err());
         assert!(capacities(&cores, &[1 << 30, 20 << 20], 4, 6, 64, None).is_err());
+    }
+
+    #[test]
+    fn mapped_host_allocations_are_counted_in_shared_and_host_budgets() {
+        let gib = 1u64 << 30;
+        let mut p = core(65536, 1 << 20, 1000);
+        p.allocations.push(Allocation {
+            name: "weights".into(),
+            nbytes: (10 * gib) as usize,
+            alignment: 65536,
+            file: None,
+            data_spans: vec![],
+            sources: vec![],
+            relocations: vec![],
+            address: Some(0x2000_0000_0000),
+            memory: Memory::Device,
+            sizing: None,
+        });
+        p.allocations.push(Allocation {
+            name: "host_numa_region".into(),
+            nbytes: (12 * gib) as usize,
+            alignment: 4096,
+            file: None,
+            data_spans: vec![],
+            sources: vec![],
+            relocations: vec![],
+            address: Some(0x2400_0000_0000),
+            memory: Memory::MappedHost,
+            sizing: None,
+        });
+        p.allocations.push(Allocation {
+            name: "peer_region".into(),
+            nbytes: (4 * gib) as usize,
+            alignment: 65536,
+            file: None,
+            data_spans: vec![],
+            sources: vec![],
+            relocations: vec![],
+            address: Some(0x2800_0000_0000),
+            memory: Memory::Peer,
+            sizing: None,
+        });
+        assert_eq!(fixed_bytes(&p, false).unwrap(), 10 * gib);
+        assert_eq!(fixed_bytes(&p, true).unwrap(), 22 * gib);
+        assert_eq!(mapped_host_bytes(&p).unwrap(), 12 * gib);
+        // Integrated GPUs charge MappedHost against the unified MemoryLimit.
+        let memory = MemorySnapshot {
+            free: 64 * gib,
+            total: 128 * gib,
+        };
+        assert!(
+            limited_budget(
+                memory,
+                fixed_bytes(&p, true).unwrap(),
+                Some(MemoryLimit::Bytes(20 * gib)),
+                HEADROOM_BYTES,
+                true,
+                0,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            limited_budget(
+                memory,
+                fixed_bytes(&p, true).unwrap(),
+                Some(MemoryLimit::Bytes(30 * gib)),
+                HEADROOM_BYTES,
+                true,
+                0,
+            )
+            .unwrap(),
+            6 * gib - HEADROOM_BYTES
+        );
+        // Host memory fit check rejects mapped-host totals exceeding available host DRAM.
+        assert!(check_host_memory_fit(12 * gib, 12 * gib).is_ok());
+        assert!(check_host_memory_fit(12 * gib, 12 * gib - 1).is_err());
     }
 
     #[test]

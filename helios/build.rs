@@ -24,6 +24,10 @@ fn main() {
                 ".flare.runtime.ExecutionGraph.packed_token_capacity",
                 "#[serde(default)]",
             )
+            .field_attribute(
+                ".flare.runtime.Execution.persistent_worker",
+                "#[serde(default)]",
+            )
             .compile_protos(&["proto/runtime_core.proto"], &["proto"])
             .expect("compile runtime core protobuf schema");
         // The payload schema imports the execution schema and refers to the generated types

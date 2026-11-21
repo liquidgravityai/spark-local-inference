@@ -7,7 +7,10 @@
 use super::{NativeResources, format::invalid, protobuf::size};
 use crate::{
     Result,
-    execution::{BufferDescriptor, ExecutionManifest, GraphDescriptor, InputBinding, TunedBinding, TuningGraphDescriptor},
+    execution::{
+        BufferDescriptor, ExecutionManifest, GraphDescriptor, InputBinding,
+        PersistentWorkerDescriptor, TunedBinding, TuningGraphDescriptor,
+    },
 };
 
 impl NativeResources {
@@ -95,15 +98,67 @@ impl NativeResources {
                 outputs: graph.outputs.clone(), status_buffer: graph.status_buffer.clone(),
             })
         }).collect::<Result<Vec<_>>>()?;
+        let persistent_worker = execution
+            .persistent_worker
+            .as_ref()
+            .map(|worker| -> Result<PersistentWorkerDescriptor> {
+                let index = self
+                    .names
+                    .iter()
+                    .position(|name| *name == worker.graph)
+                    .ok_or_else(|| invalid("persistent worker references an unknown graph"))?;
+                let stop_alloc = self.allocation(&worker.stop_flag_buffer)?;
+                let stop_flag_offset = size(worker.stop_flag_offset)?;
+                if stop_flag_offset
+                    .checked_add(4)
+                    .is_none_or(|end| end > stop_alloc.nbytes)
+                {
+                    return Err(invalid("persistent worker stop flag exceeds its allocation"));
+                }
+                let (metrics_buffer, metrics_offset, metrics_address) = if worker.metrics_count > 0
+                {
+                    let metrics_alloc = self.allocation(&worker.metrics_buffer)?;
+                    let offset = size(worker.metrics_offset)?;
+                    let bytes = size(u64::from(worker.metrics_count) * 8)?;
+                    if offset
+                        .checked_add(bytes)
+                        .is_none_or(|end| end > metrics_alloc.nbytes)
+                    {
+                        return Err(invalid("persistent worker metrics exceed their allocation"));
+                    }
+                    (
+                        Some(worker.metrics_buffer.clone()),
+                        offset,
+                        metrics_alloc.address + offset,
+                    )
+                } else {
+                    (None, 0, 0)
+                };
+                Ok(PersistentWorkerDescriptor {
+                    worker_sm_count: worker.worker_sm_count,
+                    graph: worker.graph.clone(),
+                    handle: self.executables[index] as usize,
+                    stop_flag_buffer: worker.stop_flag_buffer.clone(),
+                    stop_flag_offset,
+                    stop_flag_address: stop_alloc.address + stop_flag_offset,
+                    metrics_buffer,
+                    metrics_offset,
+                    metrics_count: worker.metrics_count,
+                    metrics_address,
+                    control: self.persistent_worker_control(),
+                })
+            })
+            .transpose()?;
         let manifest = ExecutionManifest {
             tuning_graphs,
+            persistent_worker,
             collectives: None,
             engram: None,
             cache: self.cache.clone(),
             offload: None,
             abi_version: execution.abi_version,
             completion_token_capacity: crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity),
-            context: self.context as usize,
+            context: self.execution_context() as usize,
             device: self.device,
             max_active: size(execution.max_active)?,
             input_frame_bytes: size(execution.input_frame_bytes)?,

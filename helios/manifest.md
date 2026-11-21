@@ -84,6 +84,48 @@ configurations. Outputs remain fixed during serving. Core graph selection
 retains referenced producers and their executable resources and removes unused
 producers. Tuning storage remains owned through execution drain.
 
+## Persistent worker graphs
+
+An execution catalog may optionally declare `Execution.persistent_worker`
+(Protobuf message `PersistentWorker`, field 8) to run a single dedicated graph
+concurrently with serving graphs on a spatially partitioned CUDA Green Context.
+The declaration carries:
+
+- `worker_sm_count`: positive streaming-multiprocessor count requested for the
+  worker partition; the driver splits at least that count for the worker green
+  context and assigns the non-empty remainder to the compute green context.
+- `graph`: name of a dedicated prepared graph in the rank bundle, disjoint from
+  all serving graphs and startup tuning graphs.
+- `stop_flag_buffer` and `stop_flag_offset`: a 4-byte-aligned, in-bounds 32-bit
+  word inside a `Memory::MappedHost` allocation.
+- Optional `metrics_buffer`, `metrics_offset`, and `metrics_count`: an
+  8-byte-aligned, in-bounds `u64` counter array inside a `Memory::MappedHost`
+  allocation, disjoint from the stop flag and readable from the host via
+  acquire loads without device-to-host synchronization. When `metrics_count` is
+  zero, `metrics_buffer` and `metrics_offset` must be empty/zero.
+
+`NativeResources` retains the device's primary CUDA context, partitions SMs
+through CUDA Green Context APIs, and loads all modules and instantiates and
+uploads every graph executable under its partition's green context and
+non-blocking stream (clamping cooperative launch grids to that partition's SM
+count) before the persistent worker starts. Serving and copy streams open on
+the compute green context obtained through `cuCtxFromGreenCtx`, while the
+worker graph launches once on a dedicated non-blocking stream created inside
+the worker green context after startup tuning finishes
+(`GraphExecutor::finish_startup` or `NativeResources::start_persistent_worker`).
+Launch is idempotent and zeroes the stop flag with release semantics before
+invoking `cuGraphLaunch`.
+
+During shutdown, `GraphExecutor::close` drains the compute and copy streams
+first, then signals `1u32` (release) to the stop flag and synchronizes the
+worker stream with CUDA context save/restore before releasing pinned host
+buffers (`cuMemFreeHost`) and execution streams. Resource teardown stops any
+still-running worker, destroys worker and compute streams, synchronizes the
+primary context, destroys executables, modules, and mappings, and destroys both
+green contexts before releasing virtual-address reservations and the primary
+context. A failed worker drain follows the standard failed-drain invariant: the
+driver and GPU resources remain retained until process exit.
+
 Execution ABI numbers are descriptive metadata and do not gate loading or rank
 agreement. Every engine version loads the core layouts that earlier versions
 supported. The
@@ -434,9 +476,11 @@ protoc --proto_path=helios/proto --python_out=ignition/preparation helios/proto/
 Allocation references name an allocation and byte offset. Explicit relocations
 support 64-bit pointers and 128-byte CUDA tensor maps. Model export preserves
 recorded addresses for opaque bindings. Device allocations use CUDA VMM;
-request mailboxes use registered host storage. N-gram consumers read compact
-GPU buffers populated by the shared table reader and per-rank copy streams.
-Address collisions fail loading.
+mapped-host allocations use host-NUMA CUDA VMM (`CU_MEM_LOCATION_TYPE_HOST_NUMA`)
+when the device reports `CU_DEVICE_ATTRIBUTE_HOST_NUMA_VMM`, and fall back to
+`mmap` plus `cuMemHostRegister_v2` on Unix systems without host-NUMA VMM.
+N-gram consumers read compact GPU buffers populated by the shared table reader
+and per-rank copy streams. Address collisions fail loading.
 Runtime-sized allocations map physical prefixes after fixed resources and
 selected graph executables have loaded. The configured headroom, selected
 concurrency and verification width, and remaining memory determine row and

@@ -380,6 +380,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
     ExecutionManifest {
         completion_token_capacity: config.completion_token_capacity,
         tuning_graphs: vec![],
+        persistent_worker: None,
         abi_version: 6,
         context: 1,
         device: 0,
