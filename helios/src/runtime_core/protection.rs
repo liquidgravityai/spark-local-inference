@@ -2233,9 +2233,17 @@ impl PayloadVerifiedCore {
             .map_err(|_| invalid("deployment architecture must name a compute capability"))?;
         let mut cores = Vec::with_capacity(verified.ranks().len());
         for rank in verified.ranks() {
+            let rank_arch: [i32; 2] = if rank.architecture.is_empty() {
+                architecture
+            } else {
+                rank.architecture
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| invalid("rank architecture must name a compute capability"))?
+            };
             cores.push(super::protobuf::payload_rank(
                 rank,
-                architecture,
+                rank_arch,
                 &placements,
             )?);
         }
@@ -2563,22 +2571,10 @@ impl PayloadAuthorizedCore {
             .unwrap_or(0)
     }
     pub(super) fn rank_needs(&self) -> Vec<crate::runtime_core::RankNeeds> {
-        let architecture = self
-            .source
-            .authorized
-            .verified()
-            .deployment()
-            .map(|deployment| {
-                [
-                    deployment.architecture.first().copied().unwrap_or(0),
-                    deployment.architecture.get(1).copied().unwrap_or(0),
-                ]
-            })
-            .unwrap_or_default();
         self.cores
             .iter()
             .map(|core| crate::runtime_core::RankNeeds {
-                architecture,
+                architecture: core.architecture,
                 device_bytes: core
                     .allocations
                     .iter()

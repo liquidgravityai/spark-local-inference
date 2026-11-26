@@ -343,8 +343,13 @@ pub(super) fn describe_payload(
         .iter()
         .zip(cores)
         .map(|(body, rank_core)| {
+            let architecture = if body.architecture.is_empty() {
+                &deployment.architecture
+            } else {
+                &body.architecture
+            };
             payload_rank_json(
-                &deployment.architecture,
+                architecture,
                 body,
                 rank_core,
                 locations,

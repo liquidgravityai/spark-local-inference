@@ -208,6 +208,7 @@ class Plan:
     lock_gpu_clocks: bool = False
     native_dense_activations: bool = False
     force_moe_decode_a16: bool = False
+    asymmetric_primary: bool = False
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
     tuning_replica: TuningReplica | None = None
@@ -342,6 +343,8 @@ class Plan:
 
     @property
     def free_bytes(self) -> int:
+        if self.asymmetric_primary:
+            return self.gpus[0].free_bytes
         return min(gpu.free_bytes for gpu in self.gpus)
 
     @property
@@ -450,7 +453,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
         language_model_only: bool = False, mla_compute_mode: str | None = None,
-        row_shard_prefill: bool = False, row_shard_attention: bool = False) -> Plan:
+        row_shard_prefill: bool = False, row_shard_attention: bool = False,
+        asymmetric_primary: bool = False) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
     Weights come from the checkpoint's stored tensors and graphs and scratch from
@@ -536,7 +540,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                 row_shard_prefill=row_shard_prefill, row_shard_attention=row_shard_attention, mla_compute_mode=mla_compute_mode,
                 image_concurrency=images, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
-                language_model_only=language_model_only)
+                language_model_only=language_model_only, asymmetric_primary=asymmetric_primary)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
     if cache_states is not None:
@@ -592,7 +596,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
          language_model_only: bool = False, mla_compute_mode: str | None = None,
-         row_shard_prefill: bool = False, row_shard_attention: bool = False) -> Plan:
+         row_shard_prefill: bool = False, row_shard_attention: bool = False,
+         asymmetric_primary: bool = False) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
     Without `selected`, the plan uses the smallest supported tensor-parallel size
@@ -676,7 +681,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    image_concurrency=(None if language_model_only
                                       else (None if image_concurrency is None else min(image_concurrency, concurrency))),
                    online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only,
-                   mla_compute_mode=mla_compute_mode)
+                   mla_compute_mode=mla_compute_mode, asymmetric_primary=asymmetric_primary)
 
     def automatic(world_size, **settings):
         """Plan the first GPUs that each fit, else the GPUs with the most free memory."""

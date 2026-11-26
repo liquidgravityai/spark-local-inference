@@ -965,8 +965,11 @@ class ForwardCache:
                 workers = allocate_workers([resources for _, resources, _ in demand], counts, coordinator.hosts)
                 stage.update(f"{sum(workers)} compiler workers; per rank {workers}")
                 assigned = [[] for _ in ranks]
-                for host in dict.fromkeys(coordinator.hosts):
-                    members = [index for index, name in enumerate(coordinator.hosts) if name == host]
+                capabilities = [None] * len(ranks)
+                dist.all_gather_object(capabilities, tuple(torch.cuda.get_device_capability(self.device)), group=group)
+                host_arch = list(zip(coordinator.hosts, capabilities, strict=True))
+                for key in dict.fromkeys(host_arch):
+                    members = [index for index, value in enumerate(host_arch) if value == key]
                     if not any(counts[index] for index in members):
                         continue
                     local = _balance_compilations([counts[index] for index in members],

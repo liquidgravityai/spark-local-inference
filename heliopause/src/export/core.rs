@@ -366,7 +366,32 @@ pub(crate) fn validate_ranks(
         .filter_map(|rank| rank.hardware.as_deref())
         .collect::<BTreeSet<_>>();
     if hardware.len() > 1 {
-        return Err(invalid("rank exports disagree about the preparing device"));
+        if cluster.is_some() {
+            return Err(invalid("multi-host rank exports disagree about the preparing device"));
+        }
+        let mut arch_by_hardware = std::collections::BTreeMap::<&str, &[i32]>::new();
+        let mut distinct_arches = std::collections::BTreeSet::<&[i32]>::new();
+        for rank in ranks {
+            let Some(hw) = rank.hardware.as_deref() else {
+                return Err(invalid("rank exports disagree about the preparing device"));
+            };
+            let arch = rank
+                .index
+                .ranks
+                .first()
+                .map(|bundle| bundle.architecture.as_slice())
+                .unwrap_or(&[]);
+            if arch.len() != 2 {
+                return Err(invalid("rank exports disagree about the preparing device"));
+            }
+            if let Some(prev) = arch_by_hardware.insert(hw, arch) {
+                if prev != arch {
+                    return Err(invalid("rank exports disagree about the preparing device"));
+                }
+            } else if !distinct_arches.insert(arch) {
+                return Err(invalid("rank exports disagree about the preparing device"));
+            }
+        }
     }
     if let Some(cluster) = cluster
         && ranks.len() != cluster.world as usize
@@ -1939,6 +1964,7 @@ fn rank_plan(
             roce: bundle.roce.clone(),
             prepared_weights: prepared,
             compressed_prepared_weights: None,
+            architecture: bundle.architecture.clone(),
     };
     helios_core::core::prepared_weights::compact(&mut body)?;
     Ok(payload_export::PublishRank {
@@ -2650,6 +2676,56 @@ mod payload_export_tests {
             };
             assert_eq!(peer_allocations, vec![expected_peer]);
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn single_host_mixed_architecture_ranks_preserve_per_rank_architecture_while_clusters_reject() {
+        let base = std::env::temp_dir().join(format!(
+            "flare-mixed-arch-ranks-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let sources = base.join("sources");
+        std::fs::create_dir_all(&sources).unwrap();
+
+        let mut rank0 = staged_rank_seeded(&sources, 0x31);
+        rank0.hardware = Some("gb300".into());
+        rank0.index.ranks[0].architecture = vec![10, 3];
+        let mut rank1 = staged_rank_seeded(&sources, 0x32);
+        rank1.hardware = Some("gb202".into());
+        rank1.index.ranks[0].architecture = vec![12, 0];
+
+        // Multi-host cluster still rejects mixed hardware.
+        let cluster = Some(wire::Cluster {
+            world: 2,
+            export_id: "mixed".into(),
+        });
+        assert!(validate_ranks(&[rank0.clone(), rank1.clone()], cluster.as_ref()).is_err());
+
+        // Single-host mixed-architecture export succeeds and records per-rank architectures.
+        let output = base.join("core");
+        publish_payload(
+            &output,
+            &[rank0, rank1],
+            Vec::new(),
+            None,
+            &publisher(),
+            None,
+            false,
+            "directory",
+        )
+        .unwrap();
+        let metadata = Metadata::open(&output).unwrap();
+        let envelope = helios_core::core::protection::envelope(&metadata.envelope).unwrap();
+        let mut arch_by_rank = Vec::new();
+        for signed in &envelope.ranks {
+            let body =
+                helios_core::core::schema::wire::RankBody::decode(signed.body.as_slice()).unwrap();
+            arch_by_rank.push((body.rank, body.architecture));
+        }
+        arch_by_rank.sort_by_key(|(rank, _)| *rank);
+        assert_eq!(arch_by_rank, vec![(0, vec![10, 3]), (1, vec![12, 0])]);
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -173,6 +173,8 @@ message RankBody {
   flare.runtime.RoceTransport roce = 15;
   PreparedWeightCatalog prepared_weights = 16;
   CompressedPreparedWeightCatalog compressed_prepared_weights = 17;
+  // Optional per-rank compute capability [major, minor]. Empty inherits DeploymentBody.architecture.
+  repeated int32 architecture = 18;
 }
 
 message Allocation {

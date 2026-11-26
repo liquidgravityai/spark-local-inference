@@ -469,6 +469,7 @@ pub(super) fn local_handle_limit(os: &str, clustered: bool) -> Option<u64> {
 
 pub(super) fn compact_cache_layouts(
     ranks: &[NativeResources],
+    cache_ranks: &[usize],
     geometry: &[CacheGeometry],
     layouts: &mut [Layout],
     execution: u64,
@@ -485,11 +486,12 @@ pub(super) fn compact_cache_layouts(
             (&rank.peer_readers, fixed)
         })
         .collect();
-    compact_cache_layouts_with_readers(&rank_readers, geometry, layouts, execution, limit)
+    compact_cache_layouts_with_readers(&rank_readers, cache_ranks, geometry, layouts, execution, limit)
 }
 
 fn compact_cache_layouts_with_readers(
     ranks: &[(&HashMap<u64, Vec<(usize, i32)>>, Vec<(u64, u64)>)],
+    cache_ranks: &[usize],
     geometry: &[CacheGeometry],
     layouts: &mut [Layout],
     execution: u64,
@@ -501,21 +503,25 @@ fn compact_cache_layouts_with_readers(
         return Ok((0, 0));
     };
     let mut before = 0u64;
-    let mut counts = Vec::with_capacity(ranks.len());
-    for (((peer_readers, fixed_allocs), g), layout) in
-        ranks.iter().zip(geometry).zip(layouts.iter())
-    {
+    for (peer_readers, fixed_allocs) in ranks {
         let readers = |address| peer_readers.get(&address).map_or(1, |r| r.len() as u64);
-        let row = readers(g.row.address);
-        let planes: Vec<_> = g.planes.iter().map(|p| readers(p.address)).collect();
         let fixed: u64 = fixed_allocs
             .iter()
             .map(|&(address, mappings)| mappings * (1 + readers(address)))
             .sum();
-        let cache = layout.handle_charge(row, &planes)?;
         before = before
             .checked_add(fixed)
-            .and_then(|n| n.checked_add(cache))
+            .ok_or_else(|| invalid("mapping handle count overflow"))?;
+    }
+    let mut counts = Vec::with_capacity(cache_ranks.len());
+    for ((&rank_index, g), layout) in cache_ranks.iter().zip(geometry).zip(layouts.iter()) {
+        let (peer_readers, _) = &ranks[rank_index];
+        let readers = |address| peer_readers.get(&address).map_or(1, |r| r.len() as u64);
+        let row = readers(g.row.address);
+        let planes: Vec<_> = g.planes.iter().map(|p| readers(p.address)).collect();
+        let cache = layout.handle_charge(row, &planes)?;
+        before = before
+            .checked_add(cache)
             .ok_or_else(|| invalid("mapping handle count overflow"))?;
         counts.push((row, planes, cache));
     }
@@ -991,10 +997,12 @@ mod tests {
                 .map(|g| Layout::new(g, 2, &[a; 48], a).unwrap())
                 .collect::<Vec<_>>()
         };
+        let cache_ranks: Vec<usize> = (0..16).collect();
         let mut clustered = make();
         assert_eq!(
             compact_cache_layouts_with_readers(
                 &rank_specs,
+                &cache_ranks,
                 &geometries,
                 &mut clustered,
                 2,
@@ -1006,6 +1014,7 @@ mod tests {
         let mut local = make();
         let (before, after) = compact_cache_layouts_with_readers(
             &rank_specs,
+            &cache_ranks,
             &geometries,
             &mut local,
             2,
@@ -1029,7 +1038,7 @@ mod tests {
             assert_eq!(limit, None);
             let mut layouts = [make()];
             assert_eq!(
-                compact_cache_layouts(&[], std::slice::from_ref(&g), &mut layouts, 2, limit)
+                compact_cache_layouts(&[], &[], std::slice::from_ref(&g), &mut layouts, 2, limit)
                     .unwrap(),
                 (0, 0)
             );

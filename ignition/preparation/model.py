@@ -29,7 +29,7 @@ class PreparedModel(PreparedExecution):
         if forwards is not None and set(forwards) != set(self.serving_graphs):
             raise ValueError("retained forwards must cover exactly the captured graphs")
         self.server_config = dict(server_config)
-        if self.tuned_bindings:
+        if self.tuned_bindings and "model_contract" in self.server_config:
             contract = dict(self.server_config["model_contract"])
             contract["graphs"] = [dict(graph, tuned_bindings=[dict(buffer=value.buffer, tuning_graph=value.tuning_graph)
                 for value in self.tuned_bindings.get(graph["graph"], ())]) for graph in contract["graphs"]]

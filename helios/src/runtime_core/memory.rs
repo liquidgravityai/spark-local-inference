@@ -373,6 +373,10 @@ fn capture_growth(
     host_share.checked_add(extra.div_ceil(512))
 }
 
+pub(super) fn rank_owns_cache(core: &Core) -> bool {
+    core.allocations.iter().any(|a| a.sizing.is_some())
+}
+
 fn capacities(
     cores: &[Core],
     available: &[u64],
@@ -390,6 +394,13 @@ fn capacities(
     {
         return Err(invalid("invalid cache planning geometry"));
     }
+    let cache_ranks: Vec<(usize, &Core, u64)> = cores
+        .iter()
+        .zip(available)
+        .enumerate()
+        .filter(|&(rank, (core, _))| rank == 0 || rank_owns_cache(core))
+        .map(|(rank, (core, &budget))| (rank, core, budget))
+        .collect();
     let execution = active.checked_mul(width).and_then(|rows| rows.checked_add(1))
         .filter(|&rows| rows < u32::MAX as u64)
         .ok_or_else(|| invalid("cache execution row capacity exceeds state slot IDs"))?;
@@ -401,7 +412,7 @@ fn capacities(
     }
     let mut cached = u32::MAX as u64 - execution;
     let mut maximum_pages = page_limit.map_or(u64::MAX, |limit| limit.maximum);
-    for (rank, (core, &budget)) in cores.iter().zip(available).enumerate() {
+    for &(rank, core, budget) in &cache_ranks {
         let rows: Vec<_> = core
             .allocations
             .iter()
@@ -440,7 +451,7 @@ fn capacities(
         ));
     }
     let fits = |rows, pages| {
-        cores.iter().zip(available).enumerate().all(|(rank, (p, &budget))| {
+        cache_ranks.iter().all(|&(rank, p, budget)| {
             bytes(p, 0, rows)
                 .and_then(|n| {
                     n.checked_add(bytes(p, 1, pages)?)
@@ -453,7 +464,7 @@ fn capacities(
                 })
         })
     };
-    for (rank, (core, &budget)) in cores.iter().zip(available).enumerate() {
+    for &(rank, core, budget) in &cache_ranks {
         let required = bytes(core, 0, execution)?
             .checked_add(bytes(core, 1, minimum_pages)?)
             .ok_or_else(|| invalid("cache footprint overflow"))?;
@@ -475,7 +486,7 @@ fn capacities(
         }
     }
     // Snapshot virtual rows alias KV backing; they do not consume another physical budget.
-    for core in cores {
+    for &(_, core, _) in &cache_ranks {
         let row = core
             .allocations
             .iter()
@@ -628,6 +639,11 @@ impl NativeModel {
                 .find(|buffer| buffer.name == name)
                 .map(|buffer| buffer.nbytes)
         })?;
+        let cache_rank_indices: Vec<usize> = cores
+            .iter()
+            .enumerate()
+            .filter_map(|(index, core)| (index == 0 || rank_owns_cache(core)).then_some(index))
+            .collect();
         let context = self.server_config["max_sequence_tokens"]
             .as_u64()
             .ok_or_else(|| invalid("model requires a prepared context ceiling"))?;
@@ -650,11 +666,11 @@ impl NativeModel {
                 .and_then(|n| n.checked_add(1))
                 .filter(|&rows| rows < u32::MAX as u64)
                 .ok_or_else(|| invalid("cache execution row capacity exceeds state slot IDs"))?;
-            cores
+            cache_rank_indices
                 .iter()
-                .map(|core| {
+                .map(|&index| {
                     cache_geometry(
-                        core,
+                        &cores[index],
                         contract.cache.page_tokens as u64,
                         execution_rows,
                         1,
@@ -753,7 +769,7 @@ impl NativeModel {
             let layout = flare_selene::Layout::new(&geometry)?;
             let staging = input_window;
             let (device, tier_host) = options.prefix_cache.headroom_with_inputs(
-                self.ranks.len(),
+                cache_rank_indices.len(),
                 &layout,
                 active,
                 staging != 0,
@@ -870,9 +886,10 @@ impl NativeModel {
             None
         };
         if let Some(pool) = &options.prefix_cache.pool {
-            let minimum = cores
+            let minimum = cache_rank_indices
                 .iter()
-                .map(|core| {
+                .map(|&index| {
+                    let core = &cores[index];
                     bytes(core, 0, 1 + active as u64 * width)?
                         .checked_add(bytes(core, 1, minimum_pages)?)
                         .ok_or_else(|| invalid("minimum cache footprint overflow"))
@@ -892,19 +909,20 @@ impl NativeModel {
                 .map_err(|error| error.to_string());
             let budget = crate::offload::pool::Budget {
                 host,
-                devices: available
+                devices: cache_rank_indices
                     .iter()
                     .zip(&minimum)
-                    .zip(&self.ranks)
-                    .map(|((&available, &minimum), rank)| {
-                        (available.saturating_sub(minimum), rank.integrated)
+                    .map(|(&index, &minimum)| {
+                        (
+                            available[index].saturating_sub(minimum),
+                            self.ranks[index].integrated,
+                        )
                     })
                     .collect(),
             };
-            let uuids = self
-                .ranks
+            let uuids = cache_rank_indices
                 .iter()
-                .map(|rank| crate::cuda::device_uuid(rank.device))
+                .map(|&index| crate::cuda::device_uuid(self.ranks[index].device))
                 .collect::<Result<Vec<_>>>()?;
             let cluster = self.cluster().map(|cluster| cluster.world);
             let charges = crate::offload::pool::start(
@@ -926,8 +944,8 @@ impl NativeModel {
                     None => Ok(true),
                 },
             )?;
-            for (available, charge) in available.iter_mut().zip(charges) {
-                *available = available.saturating_sub(charge);
+            for (&index, charge) in cache_rank_indices.iter().zip(charges) {
+                available[index] = available[index].saturating_sub(charge);
             }
         }
         let capture_layout = capture.then(|| flare_selene::Layout::new(&geometry)).transpose()?;
@@ -1046,17 +1064,23 @@ impl NativeModel {
         // Scheduler page ids count the model contract's tokens per page, which
         // exceeds the physical page when pages are sharded across ranks.
         let logical_page_tokens = contract.cache.page_tokens as u64;
-        let mut geometry = cores
+        let cache_rank_indices: Vec<usize> = cores
             .iter()
-            .map(|core| cache_geometry(core, logical_page_tokens, rows, pages, codec_layout))
+            .enumerate()
+            .filter_map(|(index, core)| (index == 0 || rank_owns_cache(core)).then_some(index))
+            .collect();
+        let mut geometry = cache_rank_indices
+            .iter()
+            .map(|&index| cache_geometry(&cores[index], logical_page_tokens, rows, pages, codec_layout))
             .collect::<Result<Vec<_>>>()?;
         for g in &mut geometry {
             g.placement = compression;
         }
-        let mut layouts = cores
+        let mut layouts = cache_rank_indices
             .iter()
             .zip(&geometry)
-            .map(|(core, geometry)| {
+            .map(|(&index, geometry)| {
+                let core = &cores[index];
                 let alignment = |name: &str| {
                     core.allocations
                         .iter()
@@ -1077,7 +1101,11 @@ impl NativeModel {
             })
             .collect::<Result<Vec<_>>>()?;
         let (original, planned) = super::cache_memory::compact_cache_layouts(
-            &self.ranks, &geometry, &mut layouts, execution,
+            &self.ranks,
+            &cache_rank_indices,
+            &geometry,
+            &mut layouts,
+            execution,
             super::cache_memory::local_handle_limit(std::env::consts::OS, self.cluster().is_some()),
         )?;
         if original != planned {
@@ -1104,7 +1132,8 @@ impl NativeModel {
             geometry.snapshot_pages = aliases.clone();
         }
         let mut gpu_bytes = 0;
-        for core in cores.iter_mut() {
+        for &index in &cache_rank_indices {
+            let core = &mut cores[index];
             gpu_bytes += bytes(core, 0, rows - snapshots)? + bytes(core, 1, pages)?;
             for allocation in &mut core.allocations {
                 if let Some(sizing) = allocation.sizing.as_ref() {
@@ -1148,19 +1177,15 @@ impl NativeModel {
             }
         }
         let phase = progress.phase("Allocate cache", Some(gpu_bytes));
-        for (((rank, core), geometry), layout) in self
-            .ranks
-            .iter_mut()
-            .zip(cores.iter())
-            .zip(&geometry)
-            .zip(&layouts)
-        {
+        for ((&index, geometry), layout) in cache_rank_indices.iter().zip(&geometry).zip(&layouts) {
             unsafe {
-                rank.allocate_shared_cache(core, geometry, layout)?;
+                self.ranks[index].allocate_shared_cache(&cores[index], geometry, layout)?;
             }
         }
         // Publish capacities only after every rank has mapped and granted its cache.
-        for ((rank, core), geometry) in self.ranks.iter_mut().zip(cores.iter_mut()).zip(geometry) {
+        for (&index, geometry) in cache_rank_indices.iter().zip(geometry) {
+            let rank = &mut self.ranks[index];
+            let core = &mut cores[index];
             unsafe {
                 rank.driver.check(
                     "cuCtxSetCurrent",
@@ -1858,5 +1883,32 @@ mod tests {
                 16 << 20
             );
         }
+    }
+
+    #[test]
+    fn capacities_ignore_zero_cache_peer_ranks_without_shrinking_owner_kv() {
+        let make_peer = || {
+            let mut peer = core(100 << 20, 2 << 20, 100000);
+            peer.allocations.clear();
+            peer
+        };
+        let owner = core(100 << 20, 2 << 20, 100000);
+        let peer = make_peer();
+        assert!(rank_owns_cache(&owner));
+        assert!(!rank_owns_cache(&peer));
+
+        let single = capacities(&[owner], &[80 << 30], 16, 4, 128, None, |_, _| Some(0)).unwrap();
+        let paired = capacities(
+            &[core(100 << 20, 2 << 20, 100000), peer],
+            &[80 << 30, 512 << 20],
+            16,
+            4,
+            128,
+            None,
+            |_, _| Some(0),
+        )
+        .unwrap();
+        assert_eq!(paired, single);
+        assert!(capacities(&[make_peer()], &[80 << 30], 16, 4, 128, None, |_, _| Some(0)).is_err());
     }
 }

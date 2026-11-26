@@ -301,8 +301,11 @@ impl ExecutionTiming {
         self.gpu_ns[rank] = peer.gpu_ns[0];
         match (&mut self.readiness, peer.readiness) {
             (Some(local), Some(remote)) => local.merge(remote),
-            (None, None) => Ok(()),
-            _ => Err(Error::execution(ExecutionError::Completion, "rank readiness timestamp bindings differ")),
+            (None, None) | (Some(_), None) => Ok(()),
+            (None, Some(_)) => Err(Error::execution(
+                ExecutionError::Completion,
+                "rank readiness timestamp bindings differ",
+            )),
         }
     }
 }
@@ -321,7 +324,7 @@ struct Pending {
 
 struct Frame {
     input: PinnedHost,
-    output: PinnedHost,
+    output: Option<PinnedHost>,
     confidence: Option<Readback>,
     survival: Option<Readback>,
     readiness: Option<Readback>,
@@ -482,7 +485,20 @@ impl GraphExecutor {
 
     /// Construct rank-local streams without launching any collective graphs.
     pub(super) unsafe fn new_unstarted(manifest: ExecutionManifest) -> Result<Self> {
-        manifest.validate()?;
+        unsafe { Self::new_unstarted_checked(manifest, true) }
+    }
+
+    /// Construct a peer rank's streams where completion records may be omitted.
+    pub(super) unsafe fn new_unstarted_peer(manifest: ExecutionManifest) -> Result<Self> {
+        unsafe { Self::new_unstarted_checked(manifest, false) }
+    }
+
+    unsafe fn new_unstarted_checked(
+        manifest: ExecutionManifest,
+        require_completion: bool,
+    ) -> Result<Self> {
+        manifest.validate_with_completion(require_completion)?;
+        let has_completion = manifest.has_completion_records();
         let upload_capacity = manifest
             .graphs
             .iter()
@@ -498,8 +514,10 @@ impl GraphExecutor {
             frame_index += 1;
             Ok(Frame {
                 input: model.host_buffer(manifest.input_frame_bytes)?,
-                output: model.host_buffer(manifest.completion_bytes())?,
-                logprobs: if manifest.max_top_logprobs()? != 0 {
+                output: has_completion
+                    .then(|| model.host_buffer(manifest.completion_bytes()))
+                    .transpose()?,
+                logprobs: if has_completion && manifest.max_top_logprobs()? != 0 {
                     let b = manifest.buffer("completion_logprobs")?;
                     Some(Readback::new(
                         &model, b.address + index * b.nbytes / 2, b.nbytes / 2,
@@ -507,7 +525,7 @@ impl GraphExecutor {
                 } else {
                     None
                 },
-                prompt_logprobs: if manifest.prompt_logprob_capacity()? != 0 {
+                prompt_logprobs: if has_completion && manifest.prompt_logprob_capacity()? != 0 {
                     let b = manifest.buffer("prompt_logprobs")?;
                     Some(Readback::new(
                         &model, b.address + index * b.nbytes / 2, b.nbytes / 2,
@@ -515,16 +533,19 @@ impl GraphExecutor {
                 } else {
                     None
                 },
-                confidence: manifest
-                    .graphs
-                    .iter()
-                    .any(|graph| graph.confidence_width > 0)
+                confidence: (has_completion
+                    && manifest
+                        .graphs
+                        .iter()
+                        .any(|graph| graph.confidence_width > 0))
                     .then(|| {
                         let buffer = manifest.buffer("proposal_confidence")?;
                         Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2)
                     })
                     .transpose()?,
-                survival: manifest.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival")
+                survival: has_completion
+                    .then(|| manifest.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival"))
+                    .flatten()
                     .map(|buffer| Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2))
                     .transpose()?,
                 readiness: manifest.buffers.iter().find(|buffer| buffer.name == "readiness_timestamps")
@@ -887,19 +908,21 @@ impl GraphExecutor {
             resources.model.launch(graph.handle)?;
             resources.model.record(&frame.produced)?;
             resources.copy.wait(&frame.produced)?;
-            let address = self.manifest.buffer("completion_records")?.address
-                + index * self.manifest.completion_bytes();
-            // SAFETY: The manifest bounds both completion rows; index selects one
+            // SAFETY: The manifest bounds both completion rows when present; index selects one
             // row in that retained allocation. The copy stream waits for the model
             // event, and the pinned output is not read or reused before transferred
             // completes. Shutdown drains both streams before releasing either owner.
             unsafe {
-                resources.copy.download(
-                    &frame.output,
-                    address,
-                    self.manifest.completion_bytes(),
-                )?;
-                if logprobs != 0 {
+                if let Some(output) = &frame.output {
+                    let address = self.manifest.buffer("completion_records")?.address
+                        + index * self.manifest.completion_bytes();
+                    resources.copy.download(
+                        output,
+                        address,
+                        self.manifest.completion_bytes(),
+                    )?;
+                }
+                if logprobs != 0 && frame.logprobs.is_some() {
                     let b = self.manifest.buffer("completion_logprobs")?;
                     frame.logprobs.as_ref().unwrap().enqueue_pitched_copy(
                         &resources.copy, b.address + index * b.nbytes / 2,
@@ -907,12 +930,12 @@ impl GraphExecutor {
                         self.manifest.request_capacity() * self.manifest.completion_token_capacity,
                     )?;
                 }
-                if prompt_rows != 0 {
+                if prompt_rows != 0 && frame.prompt_logprobs.is_some() {
                     let b = self.manifest.buffer("prompt_logprobs")?;
                     frame.prompt_logprobs.as_ref().unwrap().enqueue_copy(&resources.copy,
                         b.address + index * b.nbytes / 2, prompt_rows * super::PROMPT_FIELDS * 4)?;
                 }
-                if graph.confidence_width > 0 {
+                if graph.confidence_width > 0 && frame.confidence.is_some() {
                     let confidence = self.manifest.buffer("proposal_confidence")?;
                     frame.confidence.as_ref().unwrap().enqueue_copy(
                         &resources.copy, confidence.address + index * confidence.nbytes / 2, confidence.nbytes / 2,
@@ -991,19 +1014,22 @@ impl GraphExecutor {
             }
         }
         self.completed = pending.fence;
-        let records = match decode_records(
-            frame.output.bytes(),
-            pending.fence,
-            self.manifest.request_capacity(),
-            self.manifest.completion_fields(),
-        ) {
-            Ok(records) => records,
-            Err(error) => {
-                self.poison = Some(error.clone());
-                return Err(error);
-            }
+        let records = match &frame.output {
+            Some(output) => match decode_records(
+                output.bytes(),
+                pending.fence,
+                self.manifest.request_capacity(),
+                self.manifest.completion_fields(),
+            ) {
+                Ok(records) => records,
+                Err(error) => {
+                    self.poison = Some(error.clone());
+                    return Err(error);
+                }
+            },
+            None => CompletionRecords::from(Vec::new()),
         };
-        let logprobs = if pending.logprobs != 0 {
+        let logprobs = if pending.logprobs != 0 && frame.logprobs.is_some() {
             // SAFETY: This frame's transfer event covers its sidecar; the source
             // and pinned destination remain owned until decoding completes.
             let readback = frame.logprobs.as_ref().unwrap();
@@ -1030,7 +1056,10 @@ impl GraphExecutor {
         } else {
             None
         };
-        let prompt_logprobs = if pending.prompt_rows != 0 && !records.iter().any(|r| r.status == 3) {
+        let prompt_logprobs = if pending.prompt_rows != 0
+            && frame.prompt_logprobs.is_some()
+            && !records.iter().any(|r| r.status == 3)
+        {
             // SAFETY: The transfer event covers this frame; decoding precedes its release.
             let bytes = unsafe { frame.prompt_logprobs.as_ref().unwrap().bytes() };
             match decode_prompt_logprobs(bytes, pending.prompt_rows) {
@@ -1113,6 +1142,7 @@ impl GraphExecutor {
             prompt_logprobs,
             speculative_survival,
             proposal_confidence: if self.manifest.graphs[pending.graph_index].confidence_width > 0
+                && frame.confidence.is_some()
             {
                 let mut confidence = vec![vec![0.0; self.manifest.completion_token_capacity - 1]; self.manifest.request_capacity()];
                 let graph = &self.manifest.graphs[pending.graph_index];

@@ -788,9 +788,22 @@ pub fn render(value: &Value, width: usize, color: bool) -> String {
     if let Some(license) = core["license"].as_object() {
         canvas.row("license", &text(&license["name"]));
     }
-    let arch = ranks.first().map(|r| &r["architecture"]);
-    if let Some(arch) = arch.and_then(Value::as_array).filter(|a| a.len() == 2) {
-        canvas.row("architecture", &format!("sm_{}{}", arch[0], arch[1]));
+    let mut architectures = Vec::new();
+    for rank in &ranks {
+        if let Some(arch) = rank["architecture"].as_array().filter(|a| a.len() == 2) {
+            let pair = (u64_of(&arch[0]), u64_of(&arch[1]));
+            if !architectures.contains(&pair) {
+                architectures.push(pair);
+            }
+        }
+    }
+    if !architectures.is_empty() {
+        let label = architectures
+            .iter()
+            .map(|(major, minor)| format!("sm_{major}{minor}"))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        canvas.row("architecture", &label);
     }
     if model["served_names"]
         .as_array()
@@ -960,23 +973,18 @@ pub fn render(value: &Value, width: usize, color: bool) -> String {
                 thousands(vocabulary)
             },
         );
-        if let Some(first) = ranks.first() {
-            let arch = first["architecture"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            if arch.len() == 2 {
-                canvas.row(
-                    "gpu architecture",
-                    &format!(
-                        "sm_{}{} (compute capability {}.{})",
-                        u64_of(&arch[0]),
-                        u64_of(&arch[1]),
-                        u64_of(&arch[0]),
-                        u64_of(&arch[1])
-                    ),
-                );
-            }
+        if !architectures.is_empty() {
+            let label = if architectures.len() == 1 {
+                let (major, minor) = architectures[0];
+                format!("sm_{major}{minor} (compute capability {major}.{minor})")
+            } else {
+                architectures
+                    .iter()
+                    .map(|(major, minor)| format!("sm_{major}{minor}"))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            };
+            canvas.row("gpu architecture", &label);
         }
         let decode_weights = u64_of(&model["decode_weight_bytes"]);
         canvas.number(

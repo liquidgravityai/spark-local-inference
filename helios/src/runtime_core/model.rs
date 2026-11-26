@@ -22,8 +22,9 @@ pub struct NativeModel {
     pub(super) ranks: Vec<NativeResources>,
     _core_files: Vec<std::sync::Arc<std::fs::File>>,
     pub(super) server_config: serde_json::Value,
-    engram: Vec<(std::sync::Arc<crate::engram::Shared>, usize)>,
+    engram: Vec<Option<(std::sync::Arc<crate::engram::Shared>, usize)>>,
     pub(super) offload: flare_selene::offload::Startup,
+    pub(super) offload_ranks: Vec<Option<usize>>,
     gpu_codec_cubins: Vec<std::sync::Arc<Vec<u8>>>,
     cluster: Option<ClusterRank>,
     roce: Vec<Option<RoceSpec>>,
@@ -442,6 +443,9 @@ impl NativeModel {
         let mut engram: Vec<(crate::engram::Index, Vec<usize>)> = Vec::new();
         if let Some(catalog) = descriptor.engram.take() {
             for (local, core) in cores.iter().enumerate() {
+                if local > 0 && !core_binds_engram(core, &catalog) {
+                    continue;
+                }
                 let (rank, world) = cluster
                     .as_ref()
                     .map_or((local, cores.len()), |c| (c.rank, c.world));
@@ -501,8 +505,26 @@ impl NativeModel {
             .as_u64()
             .filter(|rows| *rows > 0 && *rows < i32::MAX as u64)
             .ok_or_else(|| invalid("model configuration requires a shared state-row pool"))?;
-        for core in &cores {
+        if !super::memory::rank_owns_cache(&cores[0]) {
+            return Err(invalid("rank zero requires continuation-row and KV-page allocations"));
+        }
+        for (local, core) in cores.iter().enumerate() {
             core.validate()?;
+            if local > 0 && !super::memory::rank_owns_cache(core) {
+                if core
+                    .execution
+                    .as_ref()
+                    .unwrap()
+                    .buffers
+                    .iter()
+                    .any(|b| b.name == "state_pool" || b.name == "memory_capacity")
+                {
+                    return Err(invalid(
+                        "rank without cache sizing cannot declare state_pool or memory_capacity",
+                    ));
+                }
+                continue;
+            }
             let pool = core
                 .execution
                 .as_ref()
@@ -632,6 +654,9 @@ impl NativeModel {
             })?;
             let mut cubins = Vec::with_capacity(cores.len());
             for (rank_idx, core) in cores.iter().enumerate() {
+                if rank_idx > 0 && !super::memory::rank_owns_cache(core) {
+                    continue;
+                }
                 let module = core
                     .modules
                     .iter()
@@ -659,6 +684,7 @@ impl NativeModel {
             server_config,
             engram: Vec::new(),
             offload: Default::default(),
+            offload_ranks: Vec::new(),
             gpu_codec_cubins,
             cluster,
             roce,
@@ -855,11 +881,12 @@ impl NativeModel {
                         bindings.push((local, shared.clone(), delivery_rank));
                     }
                 }
-                bindings.sort_by_key(|(local, _, _)| *local);
-                model.engram = bindings
-                    .into_iter()
-                    .map(|(_, shared, rank)| (shared, rank))
-                    .collect();
+                let mut slot_bindings: Vec<Option<(std::sync::Arc<crate::engram::Shared>, usize)>> =
+                    vec![None; model.ranks.len()];
+                for (local, shared, rank) in bindings {
+                    slot_bindings[local] = Some((shared, rank));
+                }
+                model.engram = slot_bindings;
                 let label = match storage {
                     crate::engram::Storage::Disk if embedding_table_resident_scales => {
                         "disk weights, RAM scales"
@@ -870,6 +897,7 @@ impl NativeModel {
                 let cache_bytes: u64 = model
                     .engram
                     .iter()
+                    .flatten()
                     .filter(|(_, rank)| *rank == 0)
                     .map(|(shared, _)| shared.cache_bytes())
                     .sum();
@@ -911,20 +939,18 @@ impl NativeModel {
         }
         let phase = progress.phase("Prepare host prefix cache", None);
         let identity = offload_identity(&self.server_config)?;
-        let geometry = self
-            .ranks
-            .iter()
-            .map(|rank| {
-                rank.cache_geometry()
-                    .cloned()
-                    .ok_or_else(|| invalid("rank lacks cache geometry"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let contexts: Vec<_> = self
-            .ranks
-            .iter()
-            .map(|rank| rank.context_handle())
-            .collect();
+        let mut geometry = Vec::new();
+        let mut contexts = Vec::new();
+        self.offload_ranks = vec![None; self.ranks.len()];
+        for (index, rank) in self.ranks.iter().enumerate() {
+            if let Some(cache) = rank.cache_geometry() {
+                self.offload_ranks[index] = Some(geometry.len());
+                geometry.push(cache.clone());
+                contexts.push(rank.context_handle());
+            } else if index == 0 {
+                return Err(invalid("rank lacks cache geometry"));
+            }
+        }
         let contract: crate::model::PreparedContract =
             serde_json::from_value(self.server_config["model_contract"].clone())
                 .map_err(|error| invalid(format!("invalid prepared contract: {error}")))?;
@@ -997,12 +1023,13 @@ impl NativeModel {
             .iter()
             .enumerate()
             .map(|(index, rank)| {
-                let mut manifest = rank.execution_manifest()?;
+                let mut manifest = rank.execution_manifest_with_completion(index == 0)?;
                 manifest.offload = self
-                    .offload
-                    .binding(index)
+                    .offload_ranks
+                    .get(index)
+                    .and_then(|slot| slot.and_then(|i| self.offload.binding(i)))
                     .map(|b| crate::offload::Binding::new(b, self.gpu_codec_cubins.clone()));
-                if let Some((shared, delivery_rank)) = self.engram.get(index) {
+                if let Some((shared, delivery_rank)) = self.engram.get(index).and_then(Option::as_ref) {
                     let events = shared
                         .index
                         .tables
@@ -1133,6 +1160,20 @@ fn actual_peer_readers(
     readers
 }
 
+fn core_binds_engram(core: &Core, catalog: &protobuf::wire::Engram) -> bool {
+    let Some(execution) = core.execution.as_ref() else {
+        return false;
+    };
+    catalog.tables.iter().any(|table| {
+        execution.buffers.iter().any(|buffer| {
+            buffer.name == table.weight_buffer
+                || buffer.name == table.scale_buffer
+                || buffer.name == table.hash_buffer
+                || buffer.name == table.request_buffer
+        })
+    })
+}
+
 fn validate_peer_memory(cores: &[Core], peers: &[protobuf::wire::PeerMemory]) -> Result<()> {
     let mut shared = HashSet::new();
     for peer in peers {
@@ -1147,11 +1188,11 @@ fn validate_peer_memory(cores: &[Core], peers: &[protobuf::wire::PeerMemory]) ->
             || !owner.allocations.iter().any(|a| {
                 a.address == Some(peer.address)
                     && a.extent() as u64 == peer.nbytes
-                    && matches!(a.memory, Memory::Device)
+                    && matches!(a.memory, Memory::Device | Memory::MappedHost)
             })
         {
             return Err(invalid(
-                "peer memory must name one owned device allocation and valid readers",
+                "peer memory must name one owned device or mapped-host allocation and valid readers",
             ));
         }
     }
@@ -1272,6 +1313,7 @@ mod tests {
             server_config: serde_json::Value::Null,
             engram: Vec::new(),
             offload: Default::default(),
+            offload_ranks: Vec::new(),
             cluster: None,
             roce: Vec::new(),
             gpu_codec_cubins: Vec::new(),
@@ -1740,5 +1782,61 @@ mod identity_tests {
             .unwrap_err()
             .to_string();
         assert!(cluster_err.contains("single-rank"), "{cluster_err}");
+    }
+
+    #[test]
+    fn validate_peer_memory_accepts_mapped_host_exchange_and_rejects_mismatch() {
+        use super::super::format::{Allocation, Context, Core, Memory};
+        use std::collections::HashMap;
+
+        let alloc = |name: &str, address: u64, nbytes: usize, memory: Memory| Allocation {
+            name: name.into(),
+            nbytes,
+            alignment: 4096,
+            file: None,
+            data_spans: Vec::new(),
+            sources: Vec::new(),
+            relocations: Vec::new(),
+            address: Some(address),
+            memory,
+            sizing: None,
+        };
+        let core = |allocations| Core {
+            resources: HashMap::new(),
+            architecture: [10, 3],
+            context: Context::default(),
+            reservations: Vec::new(),
+            allocations,
+            modules: Vec::new(),
+            functions: Vec::new(),
+            graphs: Vec::new(),
+            events: Vec::new(),
+            execution: None,
+        };
+        let address = 0xc000_0000_0000u64;
+        let extent = 16 << 20;
+        let cores = [
+            core(vec![alloc("host-0", address, extent, Memory::MappedHost)]),
+            core(vec![alloc("peer-0", address, extent, Memory::Peer)]),
+        ];
+        let shared = vec![protobuf::wire::PeerMemory {
+            owner: 0,
+            address,
+            nbytes: extent as u64,
+            readers: vec![0, 1],
+        }];
+        validate_peer_memory(&cores, &shared).unwrap();
+
+        let wrong_extent = vec![protobuf::wire::PeerMemory {
+            nbytes: (extent * 2) as u64,
+            ..shared[0].clone()
+        }];
+        assert!(validate_peer_memory(&cores, &wrong_extent).is_err());
+
+        let missing_reader = vec![protobuf::wire::PeerMemory {
+            readers: vec![0],
+            ..shared[0].clone()
+        }];
+        assert!(validate_peer_memory(&cores, &missing_reader).is_err());
     }
 }

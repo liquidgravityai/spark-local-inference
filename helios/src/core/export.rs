@@ -2734,6 +2734,7 @@ mod tests {
         let rank = wire::RankBody {
             rank: 0,
             deployment_id: "sm120-tp1".into(),
+            architecture: vec![],
             context: Some(crate::runtime_core::wire::Context::default()),
             reservations: vec![],
             allocations: vec![wire::Allocation {

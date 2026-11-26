@@ -1511,6 +1511,7 @@ mod tests {
         wire::RankBody {
             rank,
             deployment_id: "sm120-tp2".into(),
+            architecture: vec![],
             context: Some(runtime::Context::default()),
             reservations: vec![],
             allocations: vec![wire::Allocation {

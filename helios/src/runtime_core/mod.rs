@@ -639,7 +639,9 @@ impl NativeResources {
                                         allocation.nbytes
                                     )));
                                 }
-                                let status = (driver.host_register)(mapped, allocation.nbytes, 2);
+                                // Register with PORTABLE | DEVICEMAP when peer ranks import this mapped host region.
+                                let flags = if self.peer_readers.contains_key(&address) { 3 } else { 2 };
+                                let status = (driver.host_register)(mapped, allocation.nbytes, flags);
                                 if status != 0 {
                                     libc::munmap(mapped, allocation.nbytes);
                                 }

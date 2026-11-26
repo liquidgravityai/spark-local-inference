@@ -82,6 +82,8 @@ struct Peer {
     sender: mpsc::Sender<Command>,
     receiver: mpsc::Receiver<Result<Reply>>,
     thread: Option<JoinHandle<Shutdown>>,
+    has_completion: bool,
+    tuning_graphs: Vec<usize>,
 }
 impl Peer {
     fn send(&self, command: Command) -> Result<()> {
@@ -154,7 +156,7 @@ impl ThreadedExecutor {
             ));
         }
         for rank in &ranks {
-            rank.validate()?;
+            rank.validate_with_completion(false)?;
             if !same_layout(&manifest, rank) {
                 return Err(invalid("rank graph I/O schemas differ"));
             }
@@ -168,12 +170,14 @@ impl ThreadedExecutor {
             shutdown: None,
         };
         for (index, manifest) in ranks.into_iter().enumerate() {
+            let has_completion = manifest.has_completion_records();
+            let tuning_graphs = manifest.referenced_tuning_graphs();
             let (sender, commands) = mpsc::channel();
             let (replies, receiver) = mpsc::channel();
             let thread = thread::Builder::new()
                 .name(format!("flare-rank-{}", index + 1))
                 .spawn(move || {
-                    let mut executor = match unsafe { GraphExecutor::new_unstarted(manifest) } {
+                    let mut executor = match unsafe { GraphExecutor::new_unstarted_peer(manifest) } {
                         Ok(executor) => executor,
                         Err(error) => {
                             let _ = replies.send(Err(error.clone()));
@@ -201,6 +205,8 @@ impl ThreadedExecutor {
                 sender,
                 receiver,
                 thread: Some(thread),
+                has_completion,
+                tuning_graphs,
             };
             let ready = match peer.receiver.recv_timeout(TIMEOUT) {
                 Ok(reply) => reply,
@@ -229,19 +235,29 @@ impl ThreadedExecutor {
             result.peers.push(peer);
         }
         let startup = (|| -> Result<()> {
-            for index in result.local.manifest().referenced_tuning_graphs() {
-                for (sent, peer) in result.peers.iter().enumerate() {
-                    if let Err(error) = peer.send(Command::Tune(index)) {
-                        if sent != 0 {
-                            eprintln!("startup rank dispatch failed with unconfirmed CUDA work: {error}; terminating the CUDA process");
-                            std::process::abort();
+            let local_tuning = result.local.manifest().referenced_tuning_graphs();
+            let tuning_steps = local_tuning
+                .len()
+                .max(result.peers.iter().map(|p| p.tuning_graphs.len()).max().unwrap_or(0));
+            for step in 0..tuning_steps {
+                let mut dispatched = Vec::new();
+                for (peer_idx, peer) in result.peers.iter().enumerate() {
+                    if let Some(&index) = peer.tuning_graphs.get(step) {
+                        if let Err(error) = peer.send(Command::Tune(index)) {
+                            if !dispatched.is_empty() {
+                                eprintln!("startup rank dispatch failed with unconfirmed CUDA work: {error}; terminating the CUDA process");
+                                std::process::abort();
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
+                        dispatched.push((peer_idx, index));
                     }
                 }
-                let mut failure = result.local.run_tuning_graph(index).err();
-                for peer in &result.peers {
-                    match peer.receive() {
+                let mut failure = local_tuning
+                    .get(step)
+                    .and_then(|&index| result.local.run_tuning_graph(index).err());
+                for (peer_idx, index) in dispatched {
+                    match result.peers[peer_idx].receive() {
                         Ok(Reply::Tuned(value, status)) if value == index => {
                             if let Err(error) = status { failure.get_or_insert(error); }
                         }
@@ -413,10 +429,14 @@ impl ThreadedExecutor {
         let mut root = frame.completions[0].take().unwrap();
         for (index, completion) in frame.completions.into_iter().skip(1).enumerate() {
             let completion = completion.unwrap();
-            let agreement = if self.local.manifest().graphs[root.graph_index].kind == super::GraphKind::Speculative {
-                super::parallel::agree_speculative
-            } else { super::parallel::agree };
-            agreement(&root, &completion).map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
+            if self.peers[index].has_completion {
+                let agreement = if self.local.manifest().graphs[root.graph_index].kind == super::GraphKind::Speculative {
+                    super::parallel::agree_speculative
+                } else { super::parallel::agree };
+                agreement(&root, &completion).map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
+            } else if !completion.records.is_empty() {
+                return Err(invalid(format!("rank {}: unexpected completion records", index + 1)));
+            }
             root.timing.merge_rank(index + 1, completion.timing)?;
         }
         root.timing.queued = frame.queued;
@@ -500,6 +520,28 @@ impl Drop for ThreadedExecutor {
     }
 }
 
+fn filter_peer_uploads<'a>(manifest: &ExecutionManifest, step: &'a Step) -> Vec<Upload<'a>> {
+    if manifest.has_completion_records() {
+        return step.uploads();
+    }
+    let Some(graph) = manifest.graphs.get(step.graph) else {
+        return step.uploads();
+    };
+    step.uploads
+        .iter()
+        .filter(|u| graph.input_bindings.iter().any(|b| b.buffer_name == u.buffer))
+        .map(|u| Upload {
+            buffer: &u.buffer,
+            offset: u.offset,
+            bytes: &u.bytes,
+        })
+        .collect()
+}
+
+fn peer_uploads<'a>(executor: &GraphExecutor, step: &'a Step) -> Vec<Upload<'a>> {
+    filter_peer_uploads(executor.manifest(), step)
+}
+
 fn rank_loop(
     executor: &mut GraphExecutor,
     commands: mpsc::Receiver<Command>,
@@ -538,7 +580,8 @@ fn rank_loop(
             }
             Some(Command::Prepare(step)) => {
                 if prepared.is_some() { return Err(invalid("rank already has a prepared frame")); }
-                if executor.validate_submission(step.graph, &step.uploads(), step.grammar)? != Some(step.fence) {
+                let uploads = peer_uploads(executor, &step);
+                if executor.validate_submission(step.graph, &uploads, step.grammar)? != Some(step.fence) {
                     return Err(invalid("rank submission fence differs"));
                 }
                 send(Reply::Ready(step.fence, step.graph))?;
@@ -549,7 +592,8 @@ fn rank_loop(
                 prepared_at = None;
                 let step = prepared.take().ok_or_else(|| invalid("rank commit arrived without preparation"))?;
                 if step.fence != fence || step.graph != graph { return Err(invalid("rank commit identity differs")); }
-                if executor.submit(graph, &step.uploads(), step.grammar)? != Some(fence) {
+                let uploads = peer_uploads(executor, &step);
+                if executor.submit(graph, &uploads, step.grammar)? != Some(fence) {
                     return Err(invalid("rank fence changed after validation"));
                 }
                 started.push_back(Instant::now());
@@ -579,6 +623,44 @@ fn rank_loop(
 }
 
 fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
+    if !b.has_completion_records() {
+        return a.has_completion_records()
+            && b.engram.is_none()
+            && b.offload.is_none()
+            && b.cache.is_none()
+            && a.completion_token_capacity == b.completion_token_capacity
+            && a.max_active == b.max_active
+            && a.graphs.len() == b.graphs.len()
+            && b.buffers.iter().all(|bb| {
+                let tuning_local = b.tuning_graphs.iter().any(|t| {
+                    t.status_buffer == bb.name || t.outputs.iter().any(|o| o == &bb.name)
+                });
+                tuning_local
+                    || a.buffers.iter().any(|ab| {
+                        ab.name == bb.name
+                            && ab.dtype == bb.dtype
+                            && ab.nbytes == bb.nbytes
+                            && ab.shape == bb.shape
+                            && ab.strides == bb.strides
+                    })
+            })
+            && a.graphs.iter().zip(&b.graphs).all(|(ag, bg)| {
+                ag.name == bg.name
+                    && ag.kind == bg.kind
+                    && ag.sampling_mode == bg.sampling_mode
+                    && ag.batch_capacity == bg.batch_capacity
+                    && ag.token_capacity == bg.token_capacity
+                    && ag.draft_tokens == bg.draft_tokens
+                    && ag.confidence_width == bg.confidence_width
+                    && ag.packed_token_capacity == bg.packed_token_capacity
+                    && ag.prefill_capacity == bg.prefill_capacity
+                    && bg.input_bindings.iter().all(|bb| {
+                        ag.input_bindings
+                            .iter()
+                            .any(|ab| ab.buffer_name == bb.buffer_name && ab.nbytes == bb.nbytes)
+                    })
+            });
+    }
     match (&a.engram, &b.engram) {
         // Partitioned tables have independent delivery groups, each numbered from zero.
         (Some(a), Some(b)) if Arc::ptr_eq(&a.shared, &b.shared) && a.rank == b.rank => {
@@ -889,6 +971,97 @@ mod tests {
                 assert!(!same_layout(&ranks[0], &bad));
             }
         }
+    }
+
+    #[test]
+    fn completion_free_peer_validates_matches_layout_and_filters_uploads() {
+        use super::super::{BufferDescriptor, Dtype};
+
+        let mut root = super::super::tests::manifest();
+        root.cache = Some(flare_selene::testing::geometry(64, &[("k", 8192)], 4096));
+        root.validate().unwrap();
+
+        let mut peer = root.clone();
+        peer.context += 1;
+        peer.device = 1;
+        peer.cache = None;
+        peer.engram = None;
+        peer.buffers.retain(|b| {
+            matches!(b.name.as_str(), "frame_index" | "submission_sequence")
+        });
+        for buffer in &mut peer.buffers {
+            buffer.address += 0x20000;
+        }
+        for graph in &mut peer.graphs {
+            graph.handle += 0x20000;
+            graph.input_bindings.retain(|b| {
+                matches!(
+                    b.buffer_name.as_str(),
+                    "frame_index" | "submission_sequence"
+                )
+            });
+        }
+        assert!(!peer.has_completion_records());
+        assert!(peer.validate().is_err());
+        peer.validate_with_completion(false).unwrap();
+        assert!(same_layout(&root, &peer));
+
+        let step = Step {
+            fence: Fence(1),
+            graph: 0,
+            grammar: false,
+            uploads: vec![
+                OwnedUpload {
+                    buffer: "frame_index".into(),
+                    offset: 0,
+                    bytes: vec![1, 0, 0, 0],
+                },
+                OwnedUpload {
+                    buffer: "tokens".into(),
+                    offset: 0,
+                    bytes: vec![9, 0, 0, 0],
+                },
+                OwnedUpload {
+                    buffer: "submission_sequence".into(),
+                    offset: 0,
+                    bytes: vec![2, 0, 0, 0, 0, 0, 0, 0],
+                },
+            ],
+        };
+        let filtered = filter_peer_uploads(&peer, &step);
+        let names: Vec<&str> = filtered.iter().map(|u| u.buffer).collect();
+        assert_eq!(names, vec!["frame_index", "submission_sequence"]);
+
+        // Completion-free peers cannot declare sampling sidecars.
+        let mut with_sidecar = peer.clone();
+        with_sidecar.buffers.push(BufferDescriptor {
+            name: "proposal_confidence".into(),
+            address: 0x90000,
+            nbytes: 2 * 4 * 4,
+            dtype: Dtype::Float32,
+            shape: vec![2, 4],
+            strides: vec![4, 1],
+        });
+        assert!(with_sidecar.validate_with_completion(false).is_err());
+
+        // Independent host offsets are allowed on completion-free peers, while mismatched
+        // binding sizes, extra cache, or mismatched buffer shapes must fail layout checks.
+        let mut shifted_offset = peer.clone();
+        shifted_offset.graphs[0].input_bindings[0].host_offset += 8;
+        assert!(same_layout(&root, &shifted_offset));
+
+        let mut bad_nbytes = peer.clone();
+        bad_nbytes.graphs[0].input_bindings[0].nbytes += 4;
+        assert!(!same_layout(&root, &bad_nbytes));
+
+        let mut bad_cache = peer.clone();
+        bad_cache.cache = root.cache.clone();
+        assert!(!same_layout(&root, &bad_cache));
+
+        let mut bad_shape = peer;
+        bad_shape.buffers[0].shape = vec![2];
+        bad_shape.buffers[0].nbytes = 8;
+        assert!(!same_layout(&root, &bad_shape));
     }
 }
 

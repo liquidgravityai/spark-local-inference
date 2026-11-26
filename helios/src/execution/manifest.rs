@@ -696,7 +696,15 @@ impl ExecutionManifest {
             })
     }
 
+    pub fn has_completion_records(&self) -> bool {
+        self.buffers.iter().any(|buffer| buffer.name == "completion_records")
+    }
+
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_completion(true)
+    }
+
+    pub(crate) fn validate_with_completion(&self, require_completion: bool) -> Result<()> {
         if self.completion_token_capacity == 0 || self.completion_token_capacity > u32::MAX as usize
             || self.completion_token_capacity.checked_add(COMPLETION_METADATA_FIELDS)
                 .and_then(|n| n.checked_mul(8 * REQUEST_LANES * 2)).is_none() {
@@ -794,11 +802,6 @@ impl ExecutionManifest {
         for (name, dtype, shape) in [
             ("frame_index", Dtype::Int32, vec![1]),
             ("submission_sequence", Dtype::Int64, vec![1]),
-            (
-                "completion_records",
-                Dtype::Int64,
-                vec![2, self.request_capacity(), self.completion_fields()],
-            ),
         ] {
             let buffer = self.buffer(name)?;
             if buffer.dtype != dtype || buffer.shape != shape {
@@ -808,8 +811,37 @@ impl ExecutionManifest {
                 ));
             }
         }
+        let has_completion = self.has_completion_records();
+        if require_completion || has_completion {
+            let buffer = self.buffer("completion_records")?;
+            if buffer.dtype != Dtype::Int64
+                || buffer.shape != [2, self.request_capacity(), self.completion_fields()]
+            {
+                return Err(Error::execution(
+                    ExecutionError::Manifest,
+                    "invalid required buffer layout: completion_records",
+                ));
+            }
+        }
         let logprobs = self.max_top_logprobs()? != 0;
-        self.prompt_logprob_capacity()?;
+        if has_completion {
+            self.prompt_logprob_capacity()?;
+        } else if self.buffers.iter().any(|b| {
+            matches!(
+                b.name.as_str(),
+                "prompt_target_tokens"
+                    | "prompt_logprobs"
+                    | "completion_logprobs"
+                    | "logprob_requested"
+                    | "proposal_confidence"
+                    | "completion_speculative_survival"
+            )
+        }) {
+            return Err(Error::execution(
+                ExecutionError::Manifest,
+                "completion-free peer rank cannot declare sampling or logprob sidecars",
+            ));
+        }
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival") {
             if buffer.dtype != Dtype::Float32
                 || buffer.shape != [2, self.request_capacity(), self.completion_token_capacity - 1] {
@@ -845,7 +877,7 @@ impl ExecutionManifest {
             } else if graph.packed_token_capacity != 0 || graph.draft_tokens != 0 {
                 return Err("draft depth and target rows require a speculative operation".into());
             }
-            if graph.confidence_width > 0 {
+            if graph.confidence_width > 0 && has_completion {
                 let confidence = self.buffer("proposal_confidence")?;
                 if graph.kind != GraphKind::Speculative
                     || graph.confidence_width != graph.draft_tokens
@@ -857,6 +889,11 @@ impl ExecutionManifest {
                     || confidence.shape[2] > self.completion_token_capacity - 1 {
                     return Err("confidence output requires [2, request_slots, draft_capacity] float32 frames".into());
                 }
+            } else if graph.confidence_width > 0
+                && (graph.kind != GraphKind::Speculative
+                    || graph.confidence_width != graph.draft_tokens)
+            {
+                return Err("confidence width requires a matching speculative graph".into());
             }
             if graph.name.is_empty() || !names.insert(&graph.name) {
                 return Err(Error::execution(
@@ -938,7 +975,9 @@ impl ExecutionManifest {
                     }
                 }
             }
-            if bound.contains("prompt_target_tokens") != (graph.kind == GraphKind::ScoredPrefill) {
+            if has_completion
+                && bound.contains("prompt_target_tokens") != (graph.kind == GraphKind::ScoredPrefill)
+            {
                 return Err("only scored prefill graphs bind prompt targets".into());
             }
             if logprobs && graph.kind.samples() {
@@ -964,7 +1003,7 @@ impl ExecutionManifest {
                     format!("graph {} lacks reserved input bindings", graph.name),
                 ));
             }
-            if graph.kind == GraphKind::Mixed {
+            if has_completion && graph.kind == GraphKind::Mixed {
                 let row = self.buffer("prefill_row")?;
                 if row.dtype != Dtype::Int32 || row.shape != [1] || !bound.contains("prefill_row") {
                     return Err(Error::execution(

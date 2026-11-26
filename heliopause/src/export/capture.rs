@@ -1414,10 +1414,11 @@ fn prepare_allocations(
     {
         let recorded_allocations = recorder.recorded_allocations()?;
         for &(address, nbytes) in &request.peer_mappings {
-            if !recorded_allocations
-                .iter()
-                .any(|a| a.address == address && a.nbytes == nbytes && a.memory == "device")
-            {
+            if !recorded_allocations.iter().any(|a| {
+                a.address == address
+                    && a.nbytes == nbytes
+                    && (a.memory == "device" || a.memory == "mapped_host")
+            }) {
                 return Err(invalid(format!(
                     "peer mapping {address:#x}+{nbytes} differs from the recorded allocation"
                 )));

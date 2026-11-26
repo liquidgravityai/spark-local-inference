@@ -15,6 +15,13 @@ use crate::{
 
 impl NativeResources {
     pub fn execution_manifest(&self) -> Result<ExecutionManifest> {
+        self.execution_manifest_with_completion(true)
+    }
+
+    pub(super) fn execution_manifest_with_completion(
+        &self,
+        require_completion: bool,
+    ) -> Result<ExecutionManifest> {
         let execution = self
             .execution
             .as_ref()
@@ -198,7 +205,7 @@ impl NativeResources {
             buffers,
             graphs,
         };
-        manifest.validate()?;
+        manifest.validate_with_completion(require_completion)?;
         Ok(manifest)
     }
 }

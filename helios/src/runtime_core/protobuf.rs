@@ -1308,6 +1308,7 @@ mod payload_tests {
         payload::RankBody {
             rank: 0,
             deployment_id: "sm120-tp1".into(),
+            architecture: vec![],
             context: Some(wire::Context::default()),
             reservations: vec![wire::Reservation {
                 address: 0x1000_0000,

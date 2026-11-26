@@ -481,6 +481,16 @@ pub fn validate_rank(
     if body.rank >= ranks {
         return Err(invalid("rank id is outside its deployment"));
     }
+    if !body.architecture.is_empty() {
+        let [major, minor]: [i32; 2] = body
+            .architecture
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("rank architecture must name a compute capability"))?;
+        if major <= 0 || minor < 0 {
+            return Err(invalid("rank architecture must name a valid compute capability"));
+        }
+    }
     if body.context.is_none() {
         return Err(invalid("rank has no CUDA context description"));
     }
@@ -1727,5 +1737,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("relocation is outside its module global"), "{error}");
+    }
+
+    #[test]
+    fn rank_architecture_override_allows_empty_or_valid_pair_and_rejects_malformed() {
+        for valid in [vec![], vec![10, 3], vec![12, 0]] {
+            let (mut rank, mut catalog) = module_rank();
+            rank.architecture = valid;
+            validate_rank(&rank, 2, &mut catalog, &mut BTreeSet::new()).unwrap();
+        }
+        for invalid in [vec![12], vec![12, 0, 1], vec![0, 3], vec![-1, 0], vec![12, -1]] {
+            let (mut rank, mut catalog) = module_rank();
+            rank.architecture = invalid;
+            assert!(validate_rank(&rank, 2, &mut catalog, &mut BTreeSet::new()).is_err());
+        }
     }
 }

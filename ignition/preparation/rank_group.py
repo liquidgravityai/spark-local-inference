@@ -41,6 +41,31 @@ def minimum_across_ranks(value, group):
     return result.item()
 
 
+def _configure_rank_cute_arch(device) -> None:
+    """Tell CuTe DSL this rank's exact SM target before any compiler worker spawns.
+
+    CuTe DSL otherwise probes CUDA device zero in the rank process and falls back
+    to its default architecture inside offline compiler workers where CUDA devices
+    are hidden, causing target and cache-key mismatches on mixed-architecture hosts.
+    """
+    import sys
+    import torch
+
+    major, minor = torch.cuda.get_device_capability(device)
+    arch = f"sm_{major}{minor}{'a' if major >= 9 else ''}"
+    os.environ["CUTE_DSL_ARCH"] = arch
+    if "cutlass.cutlass_dsl" in sys.modules:
+        sys.modules["cutlass.cutlass_dsl"].CuTeDSL._get_dsl().envar._arch = arch
+    for name in ("b12x._lib.compile_options", "flashinfer.experimental.b12x._lib.compile_options"):
+        mod = sys.modules.get(name)
+        if mod is not None:
+            mod.clear_options_cache()
+    for name in ("b12x._lib.compiler", "flashinfer.experimental.b12x._lib.compiler"):
+        mod = sys.modules.get(name)
+        if mod is not None:
+            mod._DEVICE_COMPILE_CACHE_CONTEXTS.clear()
+
+
 def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepare, exporting, recording):
     import flare_heliopause
 
@@ -49,21 +74,22 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         from ignition import runtime_patches
+        import torch
 
         runtime_patches.apply()
         _use_loopback()
+        torch.cuda.set_device(config.devices[rank])
+        _configure_rank_cute_arch(config.devices[rank])
         dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=len(config.devices),
                                 timeout=_PREPARATION_TIMEOUT)
         recorder = storage = None
         if exporting:
             from .module_images import ModuleImages
             from .core_storage import CoreStorage
-            import torch
 
             # Only an export needs module images; without one, a profiler may own CUPTI.
             recorder = ModuleImages() if recording else None
             with recorder if recording else contextlib.nullcontext():
-                torch.cuda.set_device(config.devices[rank])
                 storage = CoreStorage(rank=rank, world=len(config.devices), device=config.devices[rank])
                 with storage:
                     model = prepare(snapshot, config, rank=rank, group=dist.group.WORLD, core_storage=storage)
@@ -130,6 +156,8 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
         connection.close()
         model.close()
         if storage is not None:
+            if storage.peer_storage is not None:
+                storage.peer_storage.close_host_imports()
             for region in storage.host_regions:
                 region.close()
         if release_export:
@@ -322,6 +350,7 @@ def prepare_group(snapshot, config, prepare, *, progress=None, core_storage=None
     try:
         with phase(progress, "Connect tensor-parallel ranks"):
             _use_loopback()
+            _configure_rank_cute_arch(config.devices[0])
             dist.init_process_group("gloo", init_method=address, rank=0, world_size=len(config.devices),
                                     timeout=_PREPARATION_TIMEOUT)
         model = prepare(snapshot, config, rank=0, group=dist.group.WORLD, progress=progress,

@@ -35,6 +35,7 @@ class PeerStorage(CudaRTLibrary):
         self.owned = {}
         self.imported = {}
         self.imported_mappings = {}
+        self.imported_host_regions = {}
         self.dynamic = {}
         storage.library.flare_core_allocate.restype = C.c_void_p
 
@@ -143,6 +144,41 @@ class PeerStorage(CudaRTLibrary):
                 for index, payload in enumerate(payloads):
                     addresses[index][group_rank] = self.cudaIpcOpenMemHandleBytes(payload)
         return addresses
+
+    def export_host_region(self, region, *, ranks=None):
+        """Export a shared memfd-backed HostRegion to peer ranks and record peer ownership."""
+        if DupFd is None:
+            raise RuntimeError("peer host storage requires POSIX descriptor passing")
+        if not getattr(region, "shared", False) or region.fd is None or region.closed:
+            raise ValueError("export_host_region requires an open shared HostRegion")
+        ranks = self._export_ranks if ranks is None else tuple(ranks)
+        self.owned[region.address] = region.extent
+        descriptors = [None if rank == self.storage.rank or rank not in ranks else DupFd(region.fd)
+                       for rank in range(self.storage.world)]
+        return pickle.dumps((region.address, region.extent, descriptors))
+
+    def import_host_region(self, data):
+        """Map another rank's shared HostRegion at its recorded virtual address."""
+        from .core_storage import ImportedHostRegion
+
+        address, extent, descriptors = pickle.loads(data)
+        descriptor = descriptors[self.storage.rank].detach()
+        try:
+            region = ImportedHostRegion(self.storage.cuda, address, extent, descriptor, self.storage.device)
+        finally:
+            os.close(descriptor)
+        self.imported[address] = extent
+        self.imported_mappings[address] = [(address, extent)]
+        self.imported_host_regions[address] = region
+        return region
+
+    def close_host_imports(self):
+        """Unregister and unmap imported peer host regions after execution drains."""
+        for address in list(self.imported_host_regions):
+            region = self.imported_host_regions.pop(address)
+            region.close()
+            self.imported_mappings.pop(address, None)
+            self.imported.pop(address, None)
 
     def reset(self):
         """Reset all local signals and generation-tagged payloads after group drain."""

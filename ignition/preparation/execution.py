@@ -164,7 +164,9 @@ class PreparedExecution(PreparedGraphBundle):
 
     def __init__(self, *, signatures: Mapping[str, GraphSignature], max_active: int = 4,
                  estimated_durations_ns=None, export_zero_ranges=(), export_events=None,
-                 tuning_graphs=None, tuned_bindings=None, persistent_workers=(), **kwargs):
+                 tuning_graphs=None, tuned_bindings=None, persistent_workers=(),
+                 require_completion: bool = True, completion_token_capacity: int | None = None,
+                 **kwargs):
         serving = dict(kwargs.pop("graphs"))
         tuners = dict(tuning_graphs or {})
         if set(serving).intersection(tuners):
@@ -202,10 +204,26 @@ class PreparedExecution(PreparedGraphBundle):
             raise ValueError("every prepared graph requires exactly one signature")
         if any(not isinstance(value, GraphSignature) for value in signatures.values()):
             raise TypeError("prepared graph signatures must be GraphSignature objects")
-        required = {"frame_index", "submission_sequence", "completion_records"}
-        if not required <= self.buffers.keys():
-            raise ValueError("execution requires frame index, submission sequence, and completion buffers")
-        self.completion_token_capacity = validate_completion_buffers(self.buffers, request_capacity(max_active))
+        if require_completion:
+            required = {"frame_index", "submission_sequence", "completion_records"}
+            if not required <= self.buffers.keys():
+                raise ValueError("execution requires frame index, submission sequence, and completion buffers")
+            self.completion_token_capacity = validate_completion_buffers(self.buffers, request_capacity(max_active))
+        else:
+            required = {"frame_index", "submission_sequence"}
+            if not required <= self.buffers.keys():
+                raise ValueError("peer execution requires frame index and submission sequence buffers")
+            forbidden = {"completion_records", "completion_logprobs", "logprob_requested",
+                         "logprob_token_ids", "logprob_token_id_counts", "proposal_confidence",
+                         "prompt_logprobs", "prompt_target_tokens", "completion_speculative_survival"}
+            if forbidden & self.buffers.keys():
+                raise ValueError("completion-free peer execution cannot bind completion or sampling sidecars")
+            if completion_token_capacity is None:
+                completion_token_capacity = max((s.token_capacity for s in signatures.values()
+                                                 if s.kind in ("speculative", "mixed")), default=1)
+            if type(completion_token_capacity) is not int or completion_token_capacity < 1:
+                raise ValueError("completion_token_capacity must be a positive integer")
+            self.completion_token_capacity = completion_token_capacity
         for signature in signatures.values():
             if not set(signature.inputs) <= self.buffers.keys():
                 raise ValueError("graph signature references an unregistered input buffer")

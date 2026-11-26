@@ -374,6 +374,8 @@ fn rank_coordinator_matches_model_partial_dispatch() {
                 sender,
                 receiver,
                 thread: None,
+                has_completion: true,
+                tuning_graphs: Vec::new(),
             });
             receivers.push(Some(commands));
         }

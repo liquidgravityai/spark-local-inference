@@ -341,15 +341,22 @@ class CoreStorage:
                 self._persistent_arena.close()
             self._persistent_closed = True
 
-    def host_allocate(self, name, shape, dtype):
+    def host_allocate(self, name, shape, dtype, *, shared=False):
         size = math.prod(shape) * dtype.itemsize
         # Host mappings are whole host pages; Grace kernels may use 64 KiB pages.
-        extent = -(-size // mmap.PAGESIZE) * mmap.PAGESIZE
+        # Shared peer host regions also align to CUDA VMM granularity so peer allocations
+        # preserve valid alignment when imported on another rank.
+        step = max(mmap.PAGESIZE, self.granularity) if shared else mmap.PAGESIZE
+        extent = -(-size // step) * step
         region_type = WindowsHostRegion if os.name == "nt" else HostRegion
+        if shared and os.name == "nt":
+            raise RuntimeError("shared portable host regions require POSIX memfd")
+        if shared:
+            self._host_cursor = -(-self._host_cursor // step) * step
         if self._host_cursor + extent > self.HOST_BASE + self.HOST_RESERVATION_BYTES:
             raise MemoryError("native core host-address range exhausted")
         region = region_type(self.cuda, self._host_cursor, extent, shape, dtype, self.device,
-                             lock=self.integrated)
+                             lock=self.integrated, shared=shared)
         if self._host_cursor + region.extent > self.HOST_BASE + self.HOST_RESERVATION_BYTES:
             region.close()
             raise MemoryError("native core host-address range exhausted")
@@ -424,27 +431,49 @@ class CoreStorage:
 class HostRegion:
     """Registered storage with identical CPU and device addresses."""
 
-    def __init__(self, cuda, address, extent, shape, dtype, device, *, lock=False):
+    def __init__(self, cuda, address, extent, shape, dtype, device, *, lock=False, shared=False):
         """`lock`, for a unified-memory GPU, keeps the region resident: registering host memory there
-        does not pin it, and a swapped-out page turns each GPU access into a fault."""
+        does not pin it, and a swapped-out page turns each GPU access into a fault.
+        `shared` backs the region with an anonymous memfd and registers it with
+        PORTABLE | DEVICEMAP so peer ranks can map and access the same physical host pages."""
         import torch
         from b12x.sequence._shared.disk_table import _tensor_from_pointer
 
         self.cuda, self.address, self.extent = cuda, address, extent
         self.nbytes = math.prod(shape) * dtype.itemsize
         self.closed = True
+        self.shared = bool(shared)
+        self.fd = None
         self.libc = C.CDLL(None, use_errno=True)
         self.libc.mmap.restype = C.c_void_p
-        pointer = self.libc.mmap(C.c_void_p(address), C.c_size_t(extent), C.c_int(3),
-                                 C.c_int(0x100022), C.c_int(-1), C.c_long(0))
-        if pointer != address:
-            raise OSError(C.get_errno(), f"cannot reserve native core host address {address:#x}")
+        if self.shared:
+            fd = os.memfd_create("flare-peer-host", os.MFD_CLOEXEC)
+            try:
+                os.ftruncate(fd, extent)
+                # MAP_SHARED (0x01) | MAP_FIXED_NOREPLACE (0x100000)
+                pointer = self.libc.mmap(C.c_void_p(address), C.c_size_t(extent), C.c_int(3),
+                                         C.c_int(0x100001), C.c_int(fd), C.c_long(0))
+                if pointer != address:
+                    raise OSError(C.get_errno(), f"cannot reserve shared native core host address {address:#x}")
+            except BaseException:
+                os.close(fd)
+                raise
+            self.fd = fd
+        else:
+            pointer = self.libc.mmap(C.c_void_p(address), C.c_size_t(extent), C.c_int(3),
+                                     C.c_int(0x100022), C.c_int(-1), C.c_long(0))
+            if pointer != address:
+                raise OSError(C.get_errno(), f"cannot reserve native core host address {address:#x}")
         try:
             if lock and self.libc.mlock(C.c_void_p(address), C.c_size_t(extent)):
                 raise OSError(C.get_errno(), f"cannot lock {extent} bytes of mapped host storage; raise RLIMIT_MEMLOCK")
-            cuda.call("cuMemHostRegister_v2", C.c_void_p(address), C.c_size_t(extent), C.c_uint(2))
+            flags = 3 if self.shared else 2
+            cuda.call("cuMemHostRegister_v2", C.c_void_p(address), C.c_size_t(extent), C.c_uint(flags))
         except BaseException:
             self.libc.munmap(C.c_void_p(address), C.c_size_t(extent))
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
             raise
         self.closed = False
         try:
@@ -465,6 +494,53 @@ class HostRegion:
             self.cuda.call("cuMemHostUnregister", C.c_void_p(self.address))
             if self.libc.munmap(C.c_void_p(self.address), C.c_size_t(self.extent)):
                 raise OSError(C.get_errno(), "cannot unmap native core host storage")
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
+            self.closed = True
+
+
+class ImportedHostRegion:
+    """Peer rank's mmap + CUDA host registration of another rank's shared HostRegion."""
+
+    def __init__(self, cuda, address, extent, fd, device):
+        import torch
+        from b12x.sequence._shared.disk_table import _tensor_from_pointer
+
+        self.cuda, self.address, self.extent = cuda, address, extent
+        self.closed = True
+        self.libc = C.CDLL(None, use_errno=True)
+        self.libc.mmap.restype = C.c_void_p
+        # MAP_SHARED (0x01) | MAP_FIXED_NOREPLACE (0x100000)
+        pointer = self.libc.mmap(C.c_void_p(address), C.c_size_t(extent), C.c_int(3),
+                                 C.c_int(0x100001), C.c_int(fd), C.c_long(0))
+        if pointer != address:
+            raise OSError(C.get_errno(), f"cannot import shared peer host address {address:#x}")
+        try:
+            cuda.call("cuMemHostRegister_v2", C.c_void_p(address), C.c_size_t(extent), C.c_uint(2))
+        except BaseException:
+            self.libc.munmap(C.c_void_p(address), C.c_size_t(extent))
+            raise
+        self.closed = False
+        try:
+            gpu = C.c_uint64()
+            cuda.call("cuMemHostGetDevicePointer_v2", C.byref(gpu), C.c_void_p(address), C.c_uint(0))
+            if gpu.value != address:
+                raise RuntimeError("imported peer host address differs from recorded CUDA address")
+            self.host_view = _tensor_from_pointer(
+                address, shape=(extent,), dtype=torch.uint8, device=torch.device("cpu"), nbytes=extent)
+            self.device_view = _tensor_from_pointer(
+                address, shape=(extent,), dtype=torch.uint8, device=torch.device("cuda", device), nbytes=extent)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if not self.closed:
+            self.cuda.call("cuCtxSynchronize")
+            self.cuda.call("cuMemHostUnregister", C.c_void_p(self.address))
+            if self.libc.munmap(C.c_void_p(self.address), C.c_size_t(self.extent)):
+                raise OSError(C.get_errno(), "cannot unmap imported peer host storage")
             self.closed = True
 
 
